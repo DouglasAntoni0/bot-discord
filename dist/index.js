@@ -135,23 +135,10 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
         // ── ENTROU EM UMA CALL ──
         if (!oldState.channelId && newState.channelId) {
             const embed = new discord_js_1.EmbedBuilder()
-                .setColor(0x2ecc71) // Verde
+                .setColor(0x2ecc71)
                 .setAuthor({ name: memberTag, iconURL: memberAvatar })
-                .setTitle("🎙️ Entrou em um canal de voz")
-                .addFields({
-                name: "👤 Membro",
-                value: memberMention,
-                inline: true,
-            }, {
-                name: "🔊 Canal",
-                value: `<#${newState.channelId}>`,
-                inline: true,
-            }, {
-                name: "🕐 Horário",
-                value: formatTimestamp(),
-                inline: false,
-            })
-                .setFooter({ text: `ID: ${member.user.id}` })
+                .setTitle("🎙️ Entrada em Canal de Voz")
+                .setDescription(`${memberMention} entrou no canal de voz <#${newState.channelId}>.`)
                 .setTimestamp();
             await logChannel.send({ embeds: [embed] });
             return;
@@ -161,42 +148,28 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
             // Verificar no audit log se foi desconectado por alguém
             let disconnectedBy = null;
             try {
-                const entry = await fetchAuditLog(guild, discord_js_1.AuditLogEvent.MemberDisconnect, undefined // MemberDisconnect nem sempre tem targetId confiável
-                );
+                const entry = await fetchAuditLog(guild, discord_js_1.AuditLogEvent.MemberDisconnect, undefined);
                 if (entry && entry.executor && entry.executor.id !== member.user.id) {
-                    disconnectedBy = `<@${entry.executor.id}> (${entry.executor.tag})`;
+                    disconnectedBy = `<@${entry.executor.id}>`;
                 }
             }
             catch (err) {
                 console.error("[VOICE] Erro ao verificar audit log de disconnect:", err);
             }
             const embed = new discord_js_1.EmbedBuilder()
-                .setColor(0xe74c3c) // Vermelho
                 .setAuthor({ name: memberTag, iconURL: memberAvatar })
-                .setTitle("🔇 Saiu de um canal de voz")
-                .addFields({
-                name: "👤 Membro",
-                value: memberMention,
-                inline: true,
-            }, {
-                name: "🔊 Canal",
-                value: `<#${oldState.channelId}>`,
-                inline: true,
-            }, {
-                name: "🕐 Horário",
-                value: formatTimestamp(),
-                inline: false,
-            })
-                .setFooter({ text: `ID: ${member.user.id}` })
                 .setTimestamp();
             if (disconnectedBy) {
-                embed.addFields({
-                    name: "⚠️ Desconectado por",
-                    value: disconnectedBy,
-                    inline: false,
-                });
-                embed.setTitle("🔇 Foi desconectado de um canal de voz");
-                embed.setColor(0xff6b6b);
+                embed
+                    .setColor(0xff6b6b)
+                    .setTitle("🔇 Desconectado de Canal de Voz")
+                    .setDescription(`${memberMention} foi desconectado do canal de voz <#${oldState.channelId}> por ${disconnectedBy}.`);
+            }
+            else {
+                embed
+                    .setColor(0xe74c3c)
+                    .setTitle("🔇 Saída de Canal de Voz")
+                    .setDescription(`${memberMention} saiu do canal de voz <#${oldState.channelId}>.`);
             }
             await logChannel.send({ embeds: [embed] });
             return;
@@ -207,50 +180,28 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
             oldState.channelId !== newState.channelId) {
             // Verificar no audit log quem moveu
             let movedBy = null;
-            let selfMoved = true;
             try {
                 const entry = await fetchAuditLog(guild, discord_js_1.AuditLogEvent.MemberMove, undefined);
-                if (entry && entry.executor) {
-                    if (entry.executor.id !== member.user.id) {
-                        movedBy = `<@${entry.executor.id}> (${entry.executor.tag})`;
-                        selfMoved = false;
-                    }
+                if (entry && entry.executor && entry.executor.id !== member.user.id) {
+                    movedBy = `<@${entry.executor.id}>`;
                 }
             }
             catch (err) {
                 console.error("[VOICE] Erro ao verificar audit log de move:", err);
             }
             const embed = new discord_js_1.EmbedBuilder()
-                .setColor(0xf39c12) // Amarelo/Laranja
+                .setColor(0xf39c12)
                 .setAuthor({ name: memberTag, iconURL: memberAvatar })
-                .setTitle(selfMoved
-                ? "🔀 Mudou de canal de voz"
-                : "🔀 Foi movido de canal de voz")
-                .addFields({
-                name: "👤 Membro",
-                value: memberMention,
-                inline: true,
-            }, {
-                name: "📤 De",
-                value: `<#${oldState.channelId}>`,
-                inline: true,
-            }, {
-                name: "📥 Para",
-                value: `<#${newState.channelId}>`,
-                inline: true,
-            }, {
-                name: "🕐 Horário",
-                value: formatTimestamp(),
-                inline: false,
-            })
-                .setFooter({ text: `ID: ${member.user.id}` })
                 .setTimestamp();
             if (movedBy) {
-                embed.addFields({
-                    name: "👮 Movido por",
-                    value: movedBy,
-                    inline: false,
-                });
+                embed
+                    .setTitle("🔀 Movido entre Canais de Voz")
+                    .setDescription(`${memberMention} foi movido de <#${oldState.channelId}> para <#${newState.channelId}> por ${movedBy}.`);
+            }
+            else {
+                embed
+                    .setTitle("🔀 Movido entre Canais de Voz")
+                    .setDescription(`${memberMention} se moveu de <#${oldState.channelId}> para <#${newState.channelId}>.`);
             }
             await logChannel.send({ embeds: [embed] });
             return;
@@ -268,8 +219,6 @@ client.on(discord_js_1.Events.MessageDelete, async (message) => {
         // Tentar fazer fetch do partial
         if (message.partial) {
             try {
-                // Mensagens deletadas parciais não podem ser fetched,
-                // mas tentamos usar o que está em cache
                 console.log("[MSG DELETE] Mensagem parcial detectada - usando dados do cache");
             }
             catch {
@@ -293,93 +242,36 @@ client.on(discord_js_1.Events.MessageDelete, async (message) => {
             return;
         const author = message.author;
         const content = message.content || "*[Sem conteúdo de texto]*";
-        const channelMention = `<#${message.channel.id}>`;
         // Verificar quem deletou via Audit Log
         let deletedBy = null;
-        let selfDeleted = true;
         // Pequeno delay para o audit log ser registrado
         await new Promise((resolve) => setTimeout(resolve, 1000));
         try {
             const entry = await fetchAuditLog(guild, discord_js_1.AuditLogEvent.MessageDelete, author?.id);
             if (entry && entry.executor && author) {
                 if (entry.executor.id !== author.id) {
-                    deletedBy = `<@${entry.executor.id}> (${entry.executor.tag})`;
-                    selfDeleted = false;
+                    deletedBy = `<@${entry.executor.id}>`;
                 }
             }
         }
         catch (err) {
             console.error("[MSG DELETE] Erro ao verificar audit log:", err);
         }
-        const embed = new discord_js_1.EmbedBuilder()
-            .setColor(0xe74c3c) // Vermelho
-            .setTitle("🗑️ Mensagem Deletada")
-            .addFields({
-            name: "👤 Autor da mensagem",
-            value: author ? `<@${author.id}> (${author.tag})` : "*Desconhecido*",
-            inline: true,
-        }, {
-            name: "📌 Canal",
-            value: channelMention,
-            inline: true,
-        }, {
-            name: "📝 Conteúdo",
-            value: truncateText(content),
-            inline: false,
-        })
-            .setFooter({
-            text: `ID da mensagem: ${message.id} | ID do autor: ${author?.id || "N/A"}`,
-        })
-            .setTimestamp();
-        // Quem deletou
-        if (selfDeleted) {
-            embed.addFields({
-                name: "🗑️ Deletada por",
-                value: "A própria pessoa",
-                inline: false,
-            });
+        const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
+        let description = `Mensagem de ${authorMention} em <#${message.channel.id}> foi deletada.`;
+        if (deletedBy) {
+            description += `\nDeletada por ${deletedBy}.`;
         }
-        else if (deletedBy) {
-            embed.addFields({
-                name: "👮 Deletada por",
-                value: deletedBy,
-                inline: false,
-            });
-            embed.setColor(0xff4757); // Vermelho mais vivo
-        }
-        // Se tinha anexos
+        description += `\n\n**Conteúdo:**\n${truncateText(content, 900)}`;
+        // Adicionar info de anexos se houver
         if (message.attachments && message.attachments.size > 0) {
-            const attachmentList = message.attachments
-                .map((att) => `[${att.name || "arquivo"}](${att.proxyURL || att.url}) (${att.contentType || "desconhecido"})`)
-                .join("\n");
-            embed.addFields({
-                name: "📎 Anexos",
-                value: truncateText(attachmentList),
-                inline: false,
-            });
+            description += `\n📎 ${message.attachments.size} anexo(s)`;
         }
-        // Se tinha embeds
-        if (message.embeds && message.embeds.length > 0) {
-            embed.addFields({
-                name: "📦 Embeds",
-                value: `${message.embeds.length} embed(s) na mensagem`,
-                inline: true,
-            });
-        }
-        // Se tinha stickers
-        if (message.stickers && message.stickers.size > 0) {
-            const stickerList = message.stickers.map((s) => s.name).join(", ");
-            embed.addFields({
-                name: "🏷️ Stickers",
-                value: stickerList,
-                inline: true,
-            });
-        }
-        embed.addFields({
-            name: "🕐 Horário da exclusão",
-            value: formatTimestamp(),
-            inline: false,
-        });
+        const embed = new discord_js_1.EmbedBuilder()
+            .setColor(deletedBy ? 0xff4757 : 0xe74c3c)
+            .setTitle("🗑️ Mensagem Deletada")
+            .setDescription(truncateText(description, 4096))
+            .setTimestamp();
         if (author) {
             embed.setAuthor({
                 name: author.tag,
@@ -411,46 +303,16 @@ client.on(discord_js_1.Events.MessageBulkDelete, async (messages, channel) => {
         try {
             const entry = await fetchAuditLog(guild, discord_js_1.AuditLogEvent.MessageBulkDelete);
             if (entry && entry.executor) {
-                deletedBy = `<@${entry.executor.id}> (${entry.executor.tag})`;
+                deletedBy = `<@${entry.executor.id}>`;
             }
         }
         catch (err) {
             console.error("[BULK DELETE] Erro ao verificar audit log:", err);
         }
-        const messageList = messages
-            .map((msg) => {
-            const author = msg.author
-                ? `${msg.author.tag}`
-                : "Desconhecido";
-            const content = msg.content || "[sem conteúdo]";
-            return `**${author}:** ${content}`;
-        })
-            .reverse()
-            .join("\n");
         const embed = new discord_js_1.EmbedBuilder()
-            .setColor(0x8b0000) // Vermelho escuro
+            .setColor(0x8b0000)
             .setTitle("🗑️ Mensagens Deletadas em Massa")
-            .addFields({
-            name: "📌 Canal",
-            value: `<#${channel.id}>`,
-            inline: true,
-        }, {
-            name: "📊 Quantidade",
-            value: `${messages.size} mensagem(ns)`,
-            inline: true,
-        }, {
-            name: "👮 Deletadas por",
-            value: deletedBy,
-            inline: true,
-        }, {
-            name: "📝 Mensagens",
-            value: truncateText(messageList || "*Nenhum conteúdo disponível*"),
-            inline: false,
-        }, {
-            name: "🕐 Horário",
-            value: formatTimestamp(),
-            inline: false,
-        })
+            .setDescription(`**${messages.size}** mensagens deletadas em <#${channel.id}> por ${deletedBy}.`)
             .setTimestamp();
         await logChannel.send({ embeds: [embed] });
     }
@@ -502,38 +364,14 @@ client.on(discord_js_1.Events.MessageUpdate, async (oldMessage, newMessage) => {
         if (oldContent === newContent)
             return;
         const author = newMessage.author;
-        const channelMention = `<#${newMessage.channel.id}>`;
+        const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
+        let description = `${authorMention} editou uma mensagem em <#${newMessage.channel.id}>. [Ver mensagem](${newMessage.url})`;
+        description += `\n\n**Antes:** ${truncateText(oldContent || "*[Não disponível]*", 900)}`;
+        description += `\n**Depois:** ${truncateText(newContent || "*[Sem conteúdo]*", 900)}`;
         const embed = new discord_js_1.EmbedBuilder()
-            .setColor(0x3498db) // Azul
+            .setColor(0x3498db)
             .setTitle("✏️ Mensagem Editada")
-            .addFields({
-            name: "👤 Autor",
-            value: author ? `<@${author.id}> (${author.tag})` : "*Desconhecido*",
-            inline: true,
-        }, {
-            name: "📌 Canal",
-            value: channelMention,
-            inline: true,
-        }, {
-            name: "🔗 Ir para mensagem",
-            value: `[Clique aqui](${newMessage.url})`,
-            inline: true,
-        }, {
-            name: "📝 Antes",
-            value: truncateText(oldContent || "*[Conteúdo não disponível no cache]*"),
-            inline: false,
-        }, {
-            name: "📝 Depois",
-            value: truncateText(newContent || "*[Sem conteúdo]*"),
-            inline: false,
-        }, {
-            name: "🕐 Horário da edição",
-            value: formatTimestamp(),
-            inline: false,
-        })
-            .setFooter({
-            text: `ID da mensagem: ${newMessage.id} | ID do autor: ${author?.id || "N/A"}`,
-        })
+            .setDescription(truncateText(description, 4096))
             .setTimestamp();
         if (author) {
             embed.setAuthor({
