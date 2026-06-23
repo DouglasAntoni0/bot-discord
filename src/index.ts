@@ -84,42 +84,50 @@ function truncateText(text: string, maxLength: number = 1024): string {
 }
 
 /**
- * Busca entradas recentes no Audit Log com retry
+ * Busca entradas recentes no Audit Log com retry robusto.
+ * Usa múltiplas tentativas com backoff progressivo para garantir
+ * que o audit log tenha tempo de ser registrado pelo Discord.
  */
 async function fetchAuditLog(
   guild: Guild,
   type: AuditLogEvent,
   targetId?: string,
-  retries: number = 2
+  retries: number = 4
 ): Promise<GuildAuditLogsEntry | null> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      // Pequeno delay para dar tempo do audit log ser registrado
+      // Delay progressivo: 0ms, 800ms, 1600ms, 2400ms, 3200ms
       if (attempt > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
       }
 
       const auditLogs = await guild.fetchAuditLogs({
         type,
-        limit: 5,
+        limit: 10,
       });
 
       const now = Date.now();
-      const entry = auditLogs.entries.find((e) => {
-        // A entrada deve ser recente (últimos 10 segundos)
+
+      // Primeira passagem: buscar entrada com targetId (se fornecido)
+      if (targetId) {
+        const exactMatch = auditLogs.entries.find((e) => {
+          const timeDiff = now - (e.createdTimestamp || 0);
+          if (timeDiff > 30000) return false; // 30 segundos de janela
+          return e.targetId === targetId;
+        });
+        if (exactMatch) return exactMatch;
+      }
+
+      // Segunda passagem: buscar qualquer entrada recente do mesmo tipo
+      const recentMatch = auditLogs.entries.find((e) => {
         const timeDiff = now - (e.createdTimestamp || 0);
-        if (timeDiff > 10000) return false;
-
-        // Se temos targetId, verificar se bate
-        if (targetId && e.targetId !== targetId) return false;
-
-        return true;
+        return timeDiff <= 30000; // 30 segundos de janela
       });
 
-      if (entry) return entry;
+      if (recentMatch) return recentMatch;
     } catch (error) {
       console.error(
-        `[AUDIT LOG] Erro ao buscar audit log (tentativa ${attempt + 1}):`,
+        `[AUDIT LOG] Erro ao buscar audit log (tentativa ${attempt + 1}/${retries + 1}):`,
         error
       );
     }
@@ -189,15 +197,27 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
 
     // ── SAIU DE UMA CALL ──
     if (oldState.channelId && !newState.channelId) {
-      // Verificar no audit log se foi desconectado por alguém
+      // Verificar no audit log se foi desconectado por alguém (detecção robusta)
       let disconnectedBy: string | null = null;
 
+      // Delay para dar tempo do audit log ser registrado
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
       try {
-        const entry = await fetchAuditLog(
+        // Tentativa 1: buscar pelo targetId do membro
+        let entry = await fetchAuditLog(
           guild,
           AuditLogEvent.MemberDisconnect,
-          undefined
+          member.user.id
         );
+
+        // Tentativa 2: buscar sem targetId (fallback - MemberDisconnect nem sempre tem targetId)
+        if (!entry) {
+          entry = await fetchAuditLog(
+            guild,
+            AuditLogEvent.MemberDisconnect
+          );
+        }
 
         if (entry && entry.executor && entry.executor.id !== member.user.id) {
           disconnectedBy = `<@${entry.executor.id}>`;
@@ -232,15 +252,27 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
       newState.channelId &&
       oldState.channelId !== newState.channelId
     ) {
-      // Verificar no audit log quem moveu
+      // Verificar no audit log quem moveu (detecção robusta)
       let movedBy: string | null = null;
 
+      // Delay para dar tempo do audit log ser registrado
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
       try {
-        const entry = await fetchAuditLog(
+        // Tentativa 1: buscar pelo targetId do membro
+        let entry = await fetchAuditLog(
           guild,
           AuditLogEvent.MemberMove,
-          undefined
+          member.user.id
         );
+
+        // Tentativa 2: buscar sem targetId (fallback)
+        if (!entry) {
+          entry = await fetchAuditLog(
+            guild,
+            AuditLogEvent.MemberMove
+          );
+        }
 
         if (entry && entry.executor && entry.executor.id !== member.user.id) {
           movedBy = `<@${entry.executor.id}>`;
@@ -305,52 +337,90 @@ client.on(Events.MessageDelete, async (message) => {
     const author = message.author;
     const content = message.content || "*[Sem conteúdo de texto]*";
 
-    // Verificar quem deletou via Audit Log
-    let deletedBy: string | null = null;
+    // ── Verificar quem deletou via Audit Log (detecção robusta) ──
+    let deletedByTag: string | null = null;
+    let selfDeleted = true;
 
-    // Pequeno delay para o audit log ser registrado
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // Delay inicial para dar tempo do Discord registrar no audit log
+    await new Promise((resolve) => setTimeout(resolve, 1500));
 
     try {
-      const entry = await fetchAuditLog(
+      // Tentativa 1: buscar pelo targetId do autor
+      let entry = await fetchAuditLog(
         guild,
         AuditLogEvent.MessageDelete,
         author?.id
       );
 
+      // Tentativa 2: se não encontrou, buscar sem targetId (fallback)
+      if (!entry) {
+        entry = await fetchAuditLog(
+          guild,
+          AuditLogEvent.MessageDelete
+        );
+      }
+
       if (entry && entry.executor && author) {
         if (entry.executor.id !== author.id) {
-          deletedBy = `<@${entry.executor.id}>`;
+          deletedByTag = entry.executor.tag || `<@${entry.executor.id}>`;
+          selfDeleted = false;
         }
       }
     } catch (err) {
       console.error("[MSG DELETE] Erro ao verificar audit log:", err);
     }
 
+    // ── Montar embed no estilo da foto ──
     const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
-    let description = `Mensagem de ${authorMention} em <#${message.channel.id}> foi deletada.`;
+    const channelMention = `<#${message.channel.id}>`;
 
-    if (deletedBy) {
-      description += `\nDeletada por ${deletedBy}.`;
-    }
-
-    description += `\n\n**Conteúdo:**\n${truncateText(content, 900)}`;
-
-    // Adicionar info de anexos se houver
-    if (message.attachments && message.attachments.size > 0) {
-      description += `\n📎 ${message.attachments.size} anexo(s)`;
+    // Footer com quem deletou
+    let footerText: string;
+    if (selfDeleted) {
+      footerText = "Apagada pelo próprio autor";
+    } else {
+      footerText = `Apagada por ${deletedByTag}`;
     }
 
     const embed = new EmbedBuilder()
-      .setColor(deletedBy ? 0xff4757 : 0xe74c3c)
-      .setTitle("🗑️ Mensagem Deletada")
-      .setDescription(truncateText(description, 4096))
+      .setColor(selfDeleted ? 0xe74c3c : 0xff4757)
+      .setTitle("📋 Mensagem Apagada")
+      .addFields(
+        {
+          name: "Autor:",
+          value: authorMention,
+          inline: true,
+        },
+        {
+          name: "Canal:",
+          value: channelMention,
+          inline: true,
+        },
+        {
+          name: "📋 Conteúdo",
+          value: truncateText(`\`\`\`\n${content}\n\`\`\``, 1024),
+          inline: false,
+        }
+      )
+      .setFooter({ text: footerText })
       .setTimestamp();
 
     if (author) {
       embed.setAuthor({
         name: author.tag,
         iconURL: author.displayAvatarURL({ size: 64 }),
+      });
+    }
+
+    // Adicionar info de anexos se houver
+    if (message.attachments && message.attachments.size > 0) {
+      const attachmentList = message.attachments
+        .map((att) => att.name || "arquivo")
+        .join(", ");
+      embed.addFields({
+        name: "📎 Anexos",
+        value: truncateText(attachmentList, 1024),
+        inline: false,
       });
     }
 
@@ -447,20 +517,58 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
 
     const author = newMessage.author;
     const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
+    const authorDisplay = author ? `${author.tag}` : "Desconhecido";
 
-    let description = `${authorMention} editou uma mensagem em <#${newMessage.channel.id}>. [Ver mensagem](${newMessage.url})`;
-    description += `\n\n**Antes:** ${truncateText(oldContent || "*[Não disponível]*", 900)}`;
-    description += `\n**Depois:** ${truncateText(newContent || "*[Sem conteúdo]*", 900)}`;
+    // Data de criação da mensagem
+    const createdAt = newMessage.createdAt;
+    const createdUnix = createdAt ? Math.floor(createdAt.getTime() / 1000) : 0;
 
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle("✏️ Mensagem Editada")
-      .setDescription(truncateText(description, 4096))
+      .addFields(
+        {
+          name: "Autor:",
+          value: `${authorMention} ( ${author?.id || "N/A"} )`,
+          inline: true,
+        },
+        {
+          name: "Canal:",
+          value: `<#${newMessage.channel.id}>`,
+          inline: true,
+        },
+        {
+          name: "ID da Mensagem:",
+          value: `${newMessage.id}`,
+          inline: false,
+        },
+        {
+          name: "\u200b",
+          value: `[Ir para a mensagem](${newMessage.url})`,
+          inline: false,
+        },
+        {
+          name: "📝 Antes",
+          value: truncateText(`\`\`\`\n${oldContent || "[Não disponível]"}\n\`\`\``, 1024),
+          inline: false,
+        },
+        {
+          name: "✏️ Depois",
+          value: truncateText(`\`\`\`\n${newContent || "[Sem conteúdo]"}\n\`\`\``, 1024),
+          inline: false,
+        },
+        {
+          name: "📅 Mensagem criada em",
+          value: createdUnix ? `<t:${createdUnix}:F> ( <t:${createdUnix}:R> )` : "*Desconhecido*",
+          inline: false,
+        }
+      )
+      .setFooter({ text: `Editada por: ${authorDisplay}` })
       .setTimestamp();
 
     if (author) {
       embed.setAuthor({
-        name: author.tag,
+        name: `${author.displayName} (${author.tag})`,
         iconURL: author.displayAvatarURL({ size: 64 }),
       });
     }

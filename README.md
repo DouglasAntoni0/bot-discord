@@ -7,24 +7,34 @@ Bot de Discord feito em **TypeScript** com **discord.js v14** para registrar eve
 ## 📋 Funcionalidades
 
 ### 🎙️ Logs de Voice Chat
-- Registra quem **entrou** em um canal de voz e em qual canal
-- Registra quem **saiu** de um canal de voz
-- Detecta se alguém foi **desconectado** por outra pessoa
-- Registra quando alguém é **movido** de canal, mostrando de onde → para onde
-- Identifica se a pessoa **mudou sozinha** ou se foi **movida por outra pessoa**
+- **Entrada** — registra quem entrou em um canal de voz
+- **Saída** — registra quem saiu de um canal de voz
+- **Desconectado** — detecta se alguém foi desconectado por um moderador
+- **Movido** — registra quando alguém troca de canal (sozinho ou movido por mod)
 
-### 🗑️ Logs de Mensagens Deletadas
-- Registra o **conteúdo** da mensagem deletada
-- Mostra em qual **canal** a mensagem estava
-- Identifica se foi a **própria pessoa** que deletou ou se foi um **moderador**
-- Registra **anexos** e **stickers** que estavam na mensagem
+### 📋 Logs de Mensagens Deletadas
+- Mostra **autor**, **canal** e **conteúdo** da mensagem deletada
+- Identifica se foi apagada pelo **próprio autor** ou por um **moderador**
+- Registra **anexos** que estavam na mensagem
 - Suporta **deleção em massa** (bulk delete)
 
 ### ✏️ Logs de Mensagens Editadas
-- Mostra o conteúdo **antes** da edição
-- Mostra o conteúdo **depois** da edição
-- Identifica **quem** editou
+- Mostra conteúdo **antes** e **depois** da edição (em blocos de código)
+- Mostra **autor**, **canal**, **ID da mensagem** e **data de criação**
 - Link direto para a mensagem editada
+- Footer com quem editou
+
+---
+
+## 🔍 Detecção Robusta do Audit Log
+
+O bot usa um sistema robusto para identificar quem realizou cada ação:
+
+- **5 tentativas** com backoff progressivo (800ms, 1600ms, 2400ms, 3200ms)
+- **Janela de 30 segundos** para capturar entradas do audit log
+- **Busca em dupla passagem** — primeiro por ID do alvo, depois fallback genérico
+- **10 entradas** analisadas por tentativa
+- Delay inicial antes de consultar (1500ms para mensagens, 500ms para voice)
 
 ---
 
@@ -86,7 +96,7 @@ npm start
 
 ## ☁️ Deploy na Discloud
 
-O projeto já inclui o arquivo `discloud.config` pronto.
+O projeto já inclui o arquivo `discloud.config` pronto e a pasta `dist/` com o código compilado.
 
 ### Variável de segredo na Discloud:
 
@@ -94,9 +104,9 @@ O projeto já inclui o arquivo `discloud.config` pronto.
 |-------|-------|
 | `DISCORD_TOKEN` | Seu token do bot |
 
-### Para fazer upload:
-1. Compacte os arquivos em `.zip` (**sem** `node_modules/` e `dist/`)
-2. Faça upload na Discloud
+### Via GitHub:
+1. Faça push do código para o GitHub
+2. Na Discloud, use a opção de deploy via repositório GitHub
 3. Configure o segredo `DISCORD_TOKEN` no painel
 
 ---
@@ -106,7 +116,8 @@ O projeto já inclui o arquivo `discloud.config` pronto.
 ```
 ├── src/
 │   └── index.ts          # Código principal do bot
-├── dist/                 # Código compilado (gerado pelo build)
+├── dist/                 # Código compilado (incluso no repo)
+│   └── index.js          # Arquivo principal compilado
 ├── discloud.config       # Configuração para Discloud
 ├── package.json
 ├── tsconfig.json
