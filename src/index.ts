@@ -42,6 +42,12 @@ const client = new Client({
 const LOG_CHANNEL_NAME = process.env.LOG_CHANNEL_NAME || "📜logs";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Set para rastrear mensagens que o bot está deletando automaticamente.
+// Evita que a proteção de logs dispare quando o próprio bot faz limpeza.
+// ─────────────────────────────────────────────────────────────────────────────
+const autoDeletedMessageIds = new Set<string>();
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Utilidades
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -144,6 +150,7 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`✅ Bot conectado como: ${readyClient.user.tag}`);
   console.log(`📊 Servidores: ${readyClient.guilds.cache.size}`);
   console.log(`📋 Canal de logs: ${LOG_CHANNEL_NAME}`);
+  console.log(`🧹 Limpeza automática: logs com mais de 7 dias`);
   console.log("═══════════════════════════════════════════════════════");
 
   // Verificar canais de log em todos os servidores
@@ -159,6 +166,15 @@ client.once(Events.ClientReady, (readyClient) => {
       );
     }
   });
+
+  // ── Iniciar limpeza automática de logs ──
+  // Primeira limpeza após 30 segundos do boot
+  setTimeout(() => cleanupOldLogs(readyClient), 30_000);
+
+  // Limpeza recorrente a cada 6 horas
+  setInterval(() => cleanupOldLogs(readyClient), 6 * 60 * 60 * 1000);
+
+  console.log("  🧹 Limpeza automática agendada (a cada 6 horas)");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -307,6 +323,27 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
 // ─────────────────────────────────────────────────────────────────────────────
 // Evento: Mensagem Deletada
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Mensagens de zoeira quando alguém apaga uma log do bot.
+ * O bot alterna aleatoriamente entre elas.
+ */
+const LOG_DELETE_RESPONSES = [
+  // Opção 1 — Clássica e direta
+  (name: string) =>
+    `🚨 **Epa, ${name}!** Pra que tá querendo apagar minhas logs? Tá aprontando né? Eu tô de olho em você. Vou salvar tudo, viu? Pare de aprontar, caba safado! 👀`,
+  // Opção 3 — Modo detetive
+  (name: string) => {
+    const agora = new Date();
+    const hora = agora.toLocaleTimeString("pt-BR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: "America/Sao_Paulo",
+    });
+    return `🕵️ **Log de auditoria registrada.** O(A) senhor(a) **${name}** tentou apagar uma log minha às ${hora}. Acha que pode destruir provas? Eu SOU a prova. Tô de olho, safado(a)! 📋`;
+  },
+];
+
 client.on(Events.MessageDelete, async (message) => {
   try {
     // Tentar fazer fetch do partial
@@ -327,8 +364,94 @@ client.on(Events.MessageDelete, async (message) => {
     const logChannel = getLogChannel(guild);
     if (!logChannel) return;
 
-    // Ignorar mensagens do próprio bot e do canal de logs
-    if (message.author?.id === client.user?.id) return;
+    // ─────────────────────────────────────────────────────────────────────
+    // DETECÇÃO: Alguém apagou uma log do bot no canal de logs
+    // ─────────────────────────────────────────────────────────────────────
+    if (
+      message.author?.id === client.user?.id &&
+      message.channel.id === logChannel.id
+    ) {
+      // Se foi auto-deletada pela limpeza automática, ignorar silenciosamente
+      if (autoDeletedMessageIds.has(message.id)) {
+        autoDeletedMessageIds.delete(message.id);
+        console.log("[AUTO CLEANUP] Mensagem auto-deletada removida do cache - ignorando proteção.");
+        return;
+      }
+      console.log("[LOG PROTECTION] Log do bot foi apagada! Investigando quem foi...");
+
+      // Delay para o audit log ser registrado pelo Discord
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      let culprit: string | null = null;
+      let culpritMention: string | null = null;
+
+      try {
+        // Buscar no audit log quem deletou a mensagem do bot
+        let entry = await fetchAuditLog(
+          guild,
+          AuditLogEvent.MessageDelete,
+          client.user?.id
+        );
+
+        // Fallback: buscar qualquer deleção recente
+        if (!entry) {
+          entry = await fetchAuditLog(
+            guild,
+            AuditLogEvent.MessageDelete
+          );
+        }
+
+        if (entry && entry.executor) {
+          // Ignorar se foi o próprio bot que deletou (ex: limpeza automática)
+          if (entry.executor.id === client.user?.id) {
+            console.log("[LOG PROTECTION] Bot deletou a própria log - ignorando.");
+            return;
+          }
+
+          culprit = entry.executor.displayName || entry.executor.username || entry.executor.tag;
+          culpritMention = `<@${entry.executor.id}>`;
+        }
+      } catch (err) {
+        console.error("[LOG PROTECTION] Erro ao verificar audit log:", err);
+      }
+
+      // Montar a mensagem de zoeira
+      const nome = culprit || "Algum espertinho";
+      const randomIndex = Math.floor(Math.random() * LOG_DELETE_RESPONSES.length);
+      const mensagemZoeira = LOG_DELETE_RESPONSES[randomIndex](nome);
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setTitle("🚨 ALERTA: LOG APAGADA!")
+        .setDescription(mensagemZoeira)
+        .setTimestamp();
+
+      if (culpritMention) {
+        embed.setFooter({
+          text: `Infrator: ${culprit} • Esta ocorrência foi registrada.`,
+        });
+      } else {
+        embed.setFooter({
+          text: "Não consegui identificar quem foi... mas estou de olho! 👁️",
+        });
+      }
+
+      await logChannel.send({
+        content: culpritMention ? `${culpritMention}` : undefined,
+        embeds: [embed],
+      });
+
+      console.log(
+        `[LOG PROTECTION] Mensagem de alerta enviada. Culpado: ${culprit || "Desconhecido"}`
+      );
+      return; // Não precisa logar essa deleção novamente como log normal
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // LOG NORMAL: Mensagem de outro usuário deletada em outro canal
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Ignorar mensagens do canal de logs (que não são do bot)
     if (message.channel.id === logChannel.id) return;
 
     // Ignorar bots
@@ -370,7 +493,7 @@ client.on(Events.MessageDelete, async (message) => {
       console.error("[MSG DELETE] Erro ao verificar audit log:", err);
     }
 
-    // ── Montar embed no estilo da foto ──
+    // ── Montar embed ──
     const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
     const channelMention = `<#${message.channel.id}>`;
 
@@ -578,6 +701,146 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
     console.error("[MESSAGE UPDATE] Erro geral:", error);
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Limpeza automática de logs com mais de 7 dias
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Tempo de retenção das logs: 7 dias em milissegundos */
+const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Limpa automaticamente mensagens do bot no canal de logs que têm mais de 7 dias.
+ * Usa bulkDelete para mensagens com até 14 dias (limite do Discord)
+ * e delete individual para mensagens mais antigas (caso raro).
+ */
+async function cleanupOldLogs(readyClient: Client<true>): Promise<void> {
+  console.log("[AUTO CLEANUP] Iniciando limpeza de logs antigas...");
+
+  for (const guild of readyClient.guilds.cache.values()) {
+    try {
+      const logChannel = getLogChannel(guild);
+      if (!logChannel) continue;
+
+      let totalDeleted = 0;
+      let lastMessageId: string | undefined;
+      let hasMore = true;
+
+      while (hasMore) {
+        // Buscar mensagens em lotes de 100 (limite da API)
+        const fetchOptions: { limit: number; before?: string } = { limit: 100 };
+        if (lastMessageId) fetchOptions.before = lastMessageId;
+
+        const messages = await logChannel.messages.fetch(fetchOptions);
+
+        if (messages.size === 0) {
+          hasMore = false;
+          break;
+        }
+
+        // Atualizar o cursor para a próxima página
+        const lastMsg = messages.last();
+        if (lastMsg) lastMessageId = lastMsg.id;
+
+        // Se a mensagem mais recente do lote já é mais nova que 7 dias,
+        // e a mais antiga também, pular para o próximo lote
+        const now = Date.now();
+
+        // Filtrar apenas mensagens do bot com mais de 7 dias
+        const oldBotMessages = messages.filter((msg) => {
+          const age = now - msg.createdTimestamp;
+          return msg.author.id === readyClient.user.id && age > LOG_RETENTION_MS;
+        });
+
+        if (oldBotMessages.size === 0) {
+          // Se não encontrou mensagens antigas neste lote, verificar se
+          // a mensagem mais antiga do lote tem menos de 7 dias
+          // (significa que não há mais mensagens antigas pra frente)
+          if (lastMsg && now - lastMsg.createdTimestamp < LOG_RETENTION_MS) {
+            hasMore = false;
+          }
+          continue;
+        }
+
+        // Separar mensagens em: deletáveis via bulk (<14 dias) e individuais (>14 dias)
+        const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+        const bulkDeletable = oldBotMessages.filter(
+          (msg) => now - msg.createdTimestamp < fourteenDaysMs
+        );
+        const tooOldForBulk = oldBotMessages.filter(
+          (msg) => now - msg.createdTimestamp >= fourteenDaysMs
+        );
+
+        // Registrar IDs no Set antes de deletar (para não disparar a proteção)
+        for (const [id] of oldBotMessages) {
+          autoDeletedMessageIds.add(id);
+        }
+
+        // Deletar em lote (máx 100 por vez, mín 2 para bulkDelete)
+        if (bulkDeletable.size >= 2) {
+          try {
+            await logChannel.bulkDelete(bulkDeletable);
+            totalDeleted += bulkDeletable.size;
+          } catch (err) {
+            console.error(`[AUTO CLEANUP] Erro no bulkDelete:`, err);
+            // Fallback: deletar individualmente
+            for (const [, msg] of bulkDeletable) {
+              try {
+                await msg.delete();
+                totalDeleted++;
+                // Rate limit: esperar 1 segundo entre deleções individuais
+                await new Promise((r) => setTimeout(r, 1000));
+              } catch (e) {
+                console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, e);
+              }
+            }
+          }
+        } else if (bulkDeletable.size === 1) {
+          // bulkDelete não aceita menos de 2, deletar individualmente
+          const msg = bulkDeletable.first()!;
+          try {
+            await msg.delete();
+            totalDeleted++;
+          } catch (e) {
+            console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, e);
+          }
+        }
+
+        // Deletar mensagens muito antigas individualmente
+        for (const [, msg] of tooOldForBulk) {
+          try {
+            await msg.delete();
+            totalDeleted++;
+            // Rate limit: esperar 1 segundo entre deleções
+            await new Promise((r) => setTimeout(r, 1000));
+          } catch (e) {
+            console.error(`[AUTO CLEANUP] Erro ao deletar msg antiga ${msg.id}:`, e);
+          }
+        }
+
+        // Pequeno delay entre lotes para respeitar rate limits
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+
+      if (totalDeleted > 0) {
+        console.log(
+          `[AUTO CLEANUP] [${guild.name}] ${totalDeleted} log(s) antiga(s) removida(s).`
+        );
+      } else {
+        console.log(`[AUTO CLEANUP] [${guild.name}] Nenhuma log antiga encontrada.`);
+      }
+
+      // Limpar IDs do Set após um tempo (segurança contra memory leak)
+      setTimeout(() => {
+        autoDeletedMessageIds.clear();
+      }, 60_000);
+    } catch (error) {
+      console.error(`[AUTO CLEANUP] Erro no servidor ${guild.name}:`, error);
+    }
+  }
+
+  console.log("[AUTO CLEANUP] Limpeza concluída.");
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tratamento de erros globais
