@@ -1,6 +1,7 @@
 import {
   Client,
   GatewayIntentBits,
+  Options,
   Partials,
   TextChannel,
   EmbedBuilder,
@@ -36,6 +37,12 @@ const client = new Client({
     Partials.GuildMember,// Para capturar membros parciais
     Partials.User,       // Para capturar users parciais
   ],
+  // Cache de mensagens: 500 por canal para a proteção de logs funcionar
+  // mesmo em canais movimentados. Impacto na RAM: ~1MB (desprezível).
+  makeCache: Options.cacheWithLimits({
+    ...Options.DefaultMakeCacheSettings,
+    MessageManager: 500,
+  }),
 });
 
 // Nome do canal de logs
@@ -150,7 +157,7 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`✅ Bot conectado como: ${readyClient.user.tag}`);
   console.log(`📊 Servidores: ${readyClient.guilds.cache.size}`);
   console.log(`📋 Canal de logs: ${LOG_CHANNEL_NAME}`);
-  console.log(`🧹 Limpeza automática: logs com mais de 7 dias`);
+  console.log(`🧹 Limpeza automática: logs com mais de 5 dias`);
   console.log("═══════════════════════════════════════════════════════");
 
   // Verificar canais de log em todos os servidores
@@ -703,14 +710,14 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Limpeza automática de logs com mais de 7 dias
+// Limpeza automática de logs com mais de 5 dias
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Tempo de retenção das logs: 7 dias em milissegundos */
-const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Tempo de retenção das logs: 5 dias em milissegundos */
+const LOG_RETENTION_MS = 5 * 24 * 60 * 60 * 1000;
 
 /**
- * Limpa automaticamente mensagens do bot no canal de logs que têm mais de 7 dias.
+ * Limpa automaticamente mensagens do bot no canal de logs que têm mais de 5 dias.
  * Usa bulkDelete para mensagens com até 14 dias (limite do Discord)
  * e delete individual para mensagens mais antigas (caso raro).
  */
