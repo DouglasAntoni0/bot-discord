@@ -36,6 +36,11 @@ const LOG_CHANNEL_NAME = process.env.LOG_CHANNEL_NAME || "📜logs";
 // ─────────────────────────────────────────────────────────────────────────────
 const autoDeletedMessageIds = new Set();
 // ─────────────────────────────────────────────────────────────────────────────
+// Set para rastrear mensagens de alerta (zoeira) enviadas pelo bot.
+// Quando alguém apaga o alerta, o bot fica quieto (sem loop infinito).
+// ─────────────────────────────────────────────────────────────────────────────
+const alertMessageIds = new Set();
+// ─────────────────────────────────────────────────────────────────────────────
 // Utilidades
 // ─────────────────────────────────────────────────────────────────────────────
 /**
@@ -301,6 +306,12 @@ client.on(discord_js_1.Events.MessageDelete, async (message) => {
                 console.log("[AUTO CLEANUP] Mensagem auto-deletada removida do cache - ignorando proteção.");
                 return;
             }
+            // Se era uma mensagem de alerta (zoeira), ignorar silenciosamente (sem loop)
+            if (alertMessageIds.has(message.id)) {
+                alertMessageIds.delete(message.id);
+                console.log("[LOG PROTECTION] Mensagem de alerta foi apagada - ignorando (sem loop).");
+                return;
+            }
             console.log("[LOG PROTECTION] Log do bot foi apagada! Investigando quem foi...");
             // Delay para o audit log ser registrado pelo Discord
             await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -345,11 +356,13 @@ client.on(discord_js_1.Events.MessageDelete, async (message) => {
                     text: "Não consegui identificar quem foi... mas estou de olho! 👁️",
                 });
             }
-            await logChannel.send({
+            const alertMsg = await logChannel.send({
                 content: culpritMention ? `${culpritMention}` : undefined,
                 embeds: [embed],
             });
-            console.log(`[LOG PROTECTION] Mensagem de alerta enviada. Culpado: ${culprit || "Desconhecido"}`);
+            // Salvar o ID da mensagem de alerta para não disparar proteção se apagarem ela
+            alertMessageIds.add(alertMsg.id);
+            console.log(`[LOG PROTECTION] Mensagem de alerta enviada (ID: ${alertMsg.id}). Culpado: ${culprit || "Desconhecido"}`);
             return; // Não precisa logar essa deleção novamente como log normal
         }
         // ─────────────────────────────────────────────────────────────────────
