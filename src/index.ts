@@ -111,13 +111,13 @@ async function fetchAuditLog(
   guild: Guild,
   type: AuditLogEvent,
   targetId?: string,
-  retries: number = 4
+  retries: number = 1
 ): Promise<GuildAuditLogsEntry | null> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      // Delay progressivo: 0ms, 800ms, 1600ms, 2400ms, 3200ms
+      // Delay progressivo: 0ms, 500ms
       if (attempt > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
       }
 
       const auditLogs = await guild.fetchAuditLogs({
@@ -226,27 +226,15 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
 
     // ── SAIU DE UMA CALL ──
     if (oldState.channelId && !newState.channelId) {
-      // Verificar no audit log se foi desconectado por alguém (detecção robusta)
+      // Verificar no audit log se foi desconectado por alguém
       let disconnectedBy: string | null = null;
 
-      // Delay para dar tempo do audit log ser registrado
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
       try {
-        // Tentativa 1: buscar pelo targetId do membro
-        let entry = await fetchAuditLog(
+        const entry = await fetchAuditLog(
           guild,
           AuditLogEvent.MemberDisconnect,
           member.user.id
         );
-
-        // Tentativa 2: buscar sem targetId (fallback - MemberDisconnect nem sempre tem targetId)
-        if (!entry) {
-          entry = await fetchAuditLog(
-            guild,
-            AuditLogEvent.MemberDisconnect
-          );
-        }
 
         if (entry && entry.executor && entry.executor.id !== member.user.id) {
           disconnectedBy = `<@${entry.executor.id}>`;
@@ -281,27 +269,15 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
       newState.channelId &&
       oldState.channelId !== newState.channelId
     ) {
-      // Verificar no audit log quem moveu (detecção robusta)
+      // Verificar no audit log quem moveu
       let movedBy: string | null = null;
 
-      // Delay para dar tempo do audit log ser registrado
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
       try {
-        // Tentativa 1: buscar pelo targetId do membro
-        let entry = await fetchAuditLog(
+        const entry = await fetchAuditLog(
           guild,
           AuditLogEvent.MemberMove,
           member.user.id
         );
-
-        // Tentativa 2: buscar sem targetId (fallback)
-        if (!entry) {
-          entry = await fetchAuditLog(
-            guild,
-            AuditLogEvent.MemberMove
-          );
-        }
 
         if (entry && entry.executor && entry.executor.id !== member.user.id) {
           movedBy = `<@${entry.executor.id}>`;
@@ -400,26 +376,18 @@ client.on(Events.MessageDelete, async (message) => {
       console.log("[LOG PROTECTION] Log do bot foi apagada! Investigando quem foi...");
 
       // Delay para o audit log ser registrado pelo Discord
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await new Promise((resolve) => setTimeout(resolve, 800));
 
       let culprit: string | null = null;
       let culpritMention: string | null = null;
 
       try {
         // Buscar no audit log quem deletou a mensagem do bot
-        let entry = await fetchAuditLog(
+        const entry = await fetchAuditLog(
           guild,
           AuditLogEvent.MessageDelete,
           client.user?.id
         );
-
-        // Fallback: buscar qualquer deleção recente
-        if (!entry) {
-          entry = await fetchAuditLog(
-            guild,
-            AuditLogEvent.MessageDelete
-          );
-        }
 
         if (entry && entry.executor) {
           // Ignorar se foi o próprio bot que deletou (ex: limpeza automática)
@@ -487,24 +455,15 @@ client.on(Events.MessageDelete, async (message) => {
     let deletedByTag: string | null = null;
     let selfDeleted = true;
 
-    // Delay inicial para dar tempo do Discord registrar no audit log
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // Delay para dar tempo do Discord registrar no audit log
+    await new Promise((resolve) => setTimeout(resolve, 800));
 
     try {
-      // Tentativa 1: buscar pelo targetId do autor
-      let entry = await fetchAuditLog(
+      const entry = await fetchAuditLog(
         guild,
         AuditLogEvent.MessageDelete,
         author?.id
       );
-
-      // Tentativa 2: se não encontrou, buscar sem targetId (fallback)
-      if (!entry) {
-        entry = await fetchAuditLog(
-          guild,
-          AuditLogEvent.MessageDelete
-        );
-      }
 
       if (entry && entry.executor && author) {
         if (entry.executor.id !== author.id) {
