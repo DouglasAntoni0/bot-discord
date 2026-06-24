@@ -1,143 +1,105 @@
-# 🤖 Bot Discord — Sistema de Logs
+# Bot Discord - Sistema de Logs
 
-Bot de Discord feito em **TypeScript** com **discord.js v14** para registrar eventos do servidor em um canal de logs.
+Bot de Discord em TypeScript com discord.js v14 para registrar eventos de voz, mensagens apagadas, mensagens editadas e limpeza automática do canal de logs.
 
----
+## Funcionalidades
 
-## 📋 Funcionalidades
+### Logs de voz
+- Entrada em canal de voz.
+- Saída de canal de voz.
+- Movimento entre canais.
+- Desconexão ou movimento por moderador quando o Audit Log permite correlacionar.
+- Quando o Discord não expõe alvo exato em eventos de voz, o bot marca o responsável como `provável`, não como confirmado.
 
-### 🎙️ Logs de Voice Chat
-- **Entrada** — registra quem entrou em um canal de voz
-- **Saída** — registra quem saiu de um canal de voz
-- **Desconectado** — detecta se alguém foi desconectado por um moderador
-- **Movido** — registra quando alguém troca de canal (sozinho ou movido por mod)
+### Logs de mensagens
+- Mensagens apagadas com autor, canal, ID, conteúdo disponível e anexos.
+- Mensagens parciais são registradas sem inventar autor ou conteúdo quando não estavam no cache.
+- Identificação de moderador por Audit Log com nível de confiança: `confirmado`, `provável` ou `não identificado`.
+- Bulk delete com canal, quantidade e responsável quando identificável.
+- Mensagens editadas com antes/depois, autor, canal, ID e link direto.
 
-### 📋 Logs de Mensagens Deletadas
-- Mostra **autor**, **canal** e **conteúdo** da mensagem deletada
-- Identifica se foi apagada pelo **próprio autor** ou por um **moderador**
-- Registra **anexos** que estavam na mensagem
-- Suporta **deleção em massa** (bulk delete)
+### Proteção do canal de logs
+- Se uma log enviada pelo bot for apagada, o bot registra um alerta.
+- Alertas apagados não geram loop.
+- Logs apagadas pela limpeza automática são ignoradas pela proteção.
 
-### ✏️ Logs de Mensagens Editadas
-- Mostra conteúdo **antes** e **depois** da edição (em blocos de código)
-- Mostra **autor**, **canal**, **ID da mensagem** e **data de criação**
-- Link direto para a mensagem editada
-- Footer com quem editou
+### Limpeza automática
+- Remove mensagens antigas do próprio bot no canal de logs.
+- Retenção configurável por `LOG_RETENTION_DAYS`.
+- Evita execuções sobrepostas.
+- Usa rastreamento com TTL por mensagem para não limpar o estado inteiro de proteção.
 
----
-
-## 🔍 Detecção Robusta do Audit Log
-
-O bot usa um sistema robusto para identificar quem realizou cada ação:
-
-- **5 tentativas** com backoff progressivo (800ms, 1600ms, 2400ms, 3200ms)
-- **Janela de 30 segundos** para capturar entradas do audit log
-- **Busca em dupla passagem** — primeiro por ID do alvo, depois fallback genérico
-- **10 entradas** analisadas por tentativa
-- Delay inicial antes de consultar (1500ms para mensagens, 500ms para voice)
-
----
-
-## ⚙️ Configuração
-
-### 1. Discord Developer Portal
-
-1. Acesse [discord.com/developers/applications](https://discord.com/developers/applications)
-2. Crie uma nova Application ou selecione a existente
-3. Vá em **Bot** → copie o **Token**
-4. Em **Privileged Gateway Intents**, habilite:
-   - ✅ **Presence Intent**
-   - ✅ **Server Members Intent**
-   - ✅ **Message Content Intent**
-
-### 2. Variável de Ambiente
+## Configuração
 
 Crie um arquivo `.env` na raiz do projeto:
 
 ```env
 DISCORD_TOKEN=seu_token_aqui
+LOG_CHANNEL_ID=123456789012345678
+LOG_CHANNEL_NAME=📜logs
+LOG_RETENTION_DAYS=5
 ```
 
-Ou configure a variável de ambiente `DISCORD_TOKEN` no seu serviço de hospedagem.
+`LOG_CHANNEL_ID` é a forma recomendada, porque continua funcionando mesmo se o canal for renomeado. Se ele ficar vazio, o bot procura por `LOG_CHANNEL_NAME` e alguns nomes comuns como `logs`, `📜-logs` e `📜│logs`.
 
-### 3. Canal de Logs
+`LOG_RETENTION_DAYS` aceita valores de 1 a 90. Se ficar vazio, o padrão é 5 dias.
 
-Crie um canal de texto no seu servidor Discord chamado:
+## Permissões necessárias
 
-```
-📜logs
-```
+No servidor/canal de logs, o bot precisa de:
 
-### 4. Permissões do Bot
+- View Channels
+- Send Messages
+- Embed Links
+- Read Message History
+- View Audit Log
+- Manage Messages, apenas para a limpeza automática
 
-O bot precisa das seguintes permissões:
-- `View Channels`
-- `Send Messages`
-- `Embed Links`
-- `Read Message History`
-- `View Audit Log`
+No Discord Developer Portal, habilite os intents privilegiados necessários:
 
----
+- Server Members Intent
+- Message Content Intent
 
-## 🚀 Rodando Localmente
+## Como rodar
 
 ```bash
-# Instalar dependências
 npm install
-
-# Compilar TypeScript
 npm run build
-
-# Iniciar o bot
 npm start
 ```
 
----
+Para desenvolvimento:
 
-## ☁️ Deploy na Discloud
-
-O projeto já inclui o arquivo `discloud.config` pronto e a pasta `dist/` com o código compilado.
-
-### Variável de segredo na Discloud:
-
-| Chave | Valor |
-|-------|-------|
-| `DISCORD_TOKEN` | Seu token do bot |
-
-### Via GitHub:
-1. Faça push do código para o GitHub
-2. Na Discloud, use a opção de deploy via repositório GitHub
-3. Configure o segredo `DISCORD_TOKEN` no painel
-
----
-
-## 📁 Estrutura
-
-```
-├── src/
-│   └── index.ts          # Código principal do bot
-├── dist/                 # Código compilado (incluso no repo)
-│   └── index.js          # Arquivo principal compilado
-├── discloud.config       # Configuração para Discloud
-├── package.json
-├── tsconfig.json
-├── .env.example          # Template do .env
-└── .gitignore
+```bash
+npm run dev
 ```
 
----
+## Scripts
 
-## 🛡️ Segurança
+- `npm run build`: compila TypeScript para `dist/`.
+- `npm start`: executa `dist/index.js`.
+- `npm run dev`: executa `src/index.ts` com `ts-node`.
 
-- O arquivo `.env` está no `.gitignore` — **nunca será enviado ao GitHub**
-- **Nunca** compartilhe seu token de bot publicamente
-- Se o token for exposto, **regenere imediatamente** no Developer Portal
+## Observações sobre o Audit Log
 
----
+O Discord nem sempre informa o alvo exato de todos os eventos. Por isso, o bot não assume que qualquer entrada recente do Audit Log pertence ao evento atual.
 
-## 📦 Tecnologias
+A regra agora é:
 
-- [TypeScript](https://www.typescriptlang.org/) v5
-- [discord.js](https://discord.js.org/) v14
-- [dotenv](https://www.npmjs.com/package/dotenv)
-- Node.js 18+
+- `confirmado`: tipo, alvo quando disponível, janela de tempo e executor único bateram.
+- `provável`: o Discord não expôs alvo exato, mas há entrada recente compatível com executor único.
+- `não identificado`: não houve evidência suficiente ou havia candidatos concorrentes.
+
+Essa política reduz acusações falsas e deixa claro quando o bot está inferindo.
+
+## Deploy na Discloud
+
+O projeto inclui `discloud.config` e usa `dist/index.js` como arquivo principal.
+
+Configure o segredo `DISCORD_TOKEN` no painel da Discloud. Se possível, configure também `LOG_CHANNEL_ID` e `LOG_RETENTION_DAYS`.
+
+## Segurança
+
+- `.env` está no `.gitignore`.
+- Nunca compartilhe o token do bot.
+- Se o token for exposto, regenere no Discord Developer Portal.

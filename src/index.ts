@@ -1,27 +1,45 @@
 import {
-  Client,
-  GatewayIntentBits,
-  Options,
-  Partials,
-  TextChannel,
-  EmbedBuilder,
   AuditLogEvent,
-  VoiceState,
-  Message,
+  ChannelType,
+  Client,
+  EmbedBuilder,
+  Events,
+  GatewayIntentBits,
   Guild,
   GuildAuditLogsEntry,
-  ChannelType,
-  Events,
-  ReadonlyCollection,
+  Message,
+  Options,
   PartialMessage,
+  Partials,
+  PermissionFlagsBits,
+  ReadonlyCollection,
+  TextChannel,
+  VoiceState,
 } from "discord.js";
 import { config } from "dotenv";
 
 config();
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuração do cliente com TODAS as intents e partials necessárias
-// ─────────────────────────────────────────────────────────────────────────────
+type AuditConfidence = "confirmed" | "probable" | "unknown";
+
+interface AuditResolution {
+  confidence: AuditConfidence;
+  entry: GuildAuditLogsEntry | null;
+  candidates: number;
+  reason: string;
+}
+
+interface AuditLookupOptions {
+  type: AuditLogEvent;
+  targetId?: string;
+  channelId?: string;
+  maxAgeMs?: number;
+  retries?: number;
+  initialDelayMs?: number;
+  retryDelayMs?: number;
+  allowProbable?: boolean;
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -32,118 +50,311 @@ const client = new Client({
     GatewayIntentBits.GuildModeration,
   ],
   partials: [
-    Partials.Message,    // Para capturar mensagens que não estão em cache
-    Partials.Channel,    // Para capturar canais parciais
-    Partials.GuildMember,// Para capturar membros parciais
-    Partials.User,       // Para capturar users parciais
+    Partials.Message,
+    Partials.Channel,
+    Partials.GuildMember,
+    Partials.User,
   ],
-  // Cache de mensagens: 500 por canal para a proteção de logs funcionar
-  // mesmo em canais movimentados. Impacto na RAM: ~1MB (desprezível).
   makeCache: Options.cacheWithLimits({
     ...Options.DefaultMakeCacheSettings,
     MessageManager: 500,
   }),
 });
 
-// Nome do canal de logs
-const LOG_CHANNEL_NAME = process.env.LOG_CHANNEL_NAME || "📜logs";
+const DEFAULT_LOG_CHANNEL_NAME = "📜logs";
+const FALLBACK_LOG_CHANNEL_NAMES = [
+  DEFAULT_LOG_CHANNEL_NAME,
+  "logs",
+  "📜-logs",
+  "📜│logs",
+];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Set para rastrear mensagens que o bot está deletando automaticamente.
-// Evita que a proteção de logs dispare quando o próprio bot faz limpeza.
-// ─────────────────────────────────────────────────────────────────────────────
-const autoDeletedMessageIds = new Set<string>();
+const LOG_CHANNEL_NAME = readTextEnv("LOG_CHANNEL_NAME", DEFAULT_LOG_CHANNEL_NAME);
+const LOG_CHANNEL_ID = readSnowflakeEnv("LOG_CHANNEL_ID");
+const LOG_RETENTION_DAYS = readIntegerEnv("LOG_RETENTION_DAYS", 5, 1, 90);
+const LOG_RETENTION_MS = LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const AUDIT_LOG_MAX_AGE_MS = 30_000;
+const TRACKED_DELETE_TTL_MS = 10 * 60 * 1000;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Set para rastrear mensagens de alerta (zoeira) enviadas pelo bot.
-// Quando alguém apaga o alerta, o bot fica quieto (sem loop infinito).
-// ─────────────────────────────────────────────────────────────────────────────
-const alertMessageIds = new Set<string>();
+const logChannelCache = new Map<string, string>();
+let cleanupRunning = false;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Utilidades
-// ─────────────────────────────────────────────────────────────────────────────
+class ExpiringIdSet {
+  private readonly timeouts = new Map<string, NodeJS.Timeout>();
 
-/**
- * Busca o canal de logs em um servidor.
- * Procura por nome exato, incluindo com e sem emoji.
- */
-function getLogChannel(guild: Guild): TextChannel | null {
-  const channel = guild.channels.cache.find(
-    (ch) =>
-      ch.type === ChannelType.GuildText &&
-      (ch.name === LOG_CHANNEL_NAME ||
-        ch.name === "📜logs" ||
-        ch.name === "logs" ||
-        ch.name === "📜-logs" ||
-        ch.name === "📜│logs")
-  );
+  constructor(private readonly defaultTtlMs: number) {}
 
-  if (channel && channel.type === ChannelType.GuildText) {
-    return channel as TextChannel;
+  add(id: string, ttlMs = this.defaultTtlMs): void {
+    this.delete(id);
+
+    const timeout = setTimeout(() => {
+      this.timeouts.delete(id);
+    }, ttlMs);
+
+    timeout.unref?.();
+    this.timeouts.set(id, timeout);
   }
 
-  return null;
+  consume(id: string): boolean {
+    const timeout = this.timeouts.get(id);
+    if (!timeout) return false;
+
+    clearTimeout(timeout);
+    this.timeouts.delete(id);
+    return true;
+  }
+
+  delete(id: string): void {
+    const timeout = this.timeouts.get(id);
+    if (!timeout) return;
+
+    clearTimeout(timeout);
+    this.timeouts.delete(id);
+  }
 }
 
-/**
- * Formata timestamp para o Discord (formato relativo e absoluto)
- */
+const autoDeletedMessageIds = new ExpiringIdSet(TRACKED_DELETE_TTL_MS);
+const alertMessageIds = new ExpiringIdSet(TRACKED_DELETE_TTL_MS);
+
+function readTextEnv(name: string, defaultValue: string): string {
+  const value = process.env[name]?.trim();
+  return value && value.length > 0 ? value : defaultValue;
+}
+
+function readSnowflakeEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+
+  const match = value.match(/\d{17,20}/);
+  if (!match) {
+    console.warn(`[CONFIG] ${name} inválido. Usando fallback por nome de canal.`);
+    return undefined;
+  }
+
+  return match[0];
+}
+
+function readIntegerEnv(
+  name: string,
+  defaultValue: number,
+  min: number,
+  max: number
+): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return defaultValue;
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    console.warn(`[CONFIG] ${name} inválido (${raw}). Usando ${defaultValue}.`);
+    return defaultValue;
+  }
+
+  if (parsed < min || parsed > max) {
+    const clamped = Math.min(Math.max(parsed, min), max);
+    console.warn(
+      `[CONFIG] ${name} fora do intervalo ${min}-${max}. Usando ${clamped}.`
+    );
+    return clamped;
+  }
+
+  return parsed;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function truncateText(text: string, maxLength = 1024): string {
+  if (text.length <= maxLength) return text;
+  if (maxLength <= 3) return text.slice(0, maxLength);
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function escapeCodeBlock(text: string): string {
+  return text.replace(/```/g, "`\u200b``");
+}
+
+function formatCodeBlock(
+  text: string,
+  emptyText = "[Sem conteúdo de texto]",
+  maxLength = 1024
+): string {
+  const prefix = "```\n";
+  const suffix = "\n```";
+  const value = text.length > 0 ? text : emptyText;
+  const maxBodyLength = Math.max(0, maxLength - prefix.length - suffix.length);
+  return `${prefix}${truncateText(escapeCodeBlock(value), maxBodyLength)}${suffix}`;
+}
+
 function formatTimestamp(date: Date = new Date()): string {
   const unix = Math.floor(date.getTime() / 1000);
   return `<t:${unix}:F> (<t:${unix}:R>)`;
 }
 
-/**
- * Trunca texto para caber no embed (máximo 1024 chars por field)
- */
-function truncateText(text: string, maxLength: number = 1024): string {
-  if (text.length <= maxLength) return text;
-  return text.substring(0, maxLength - 3) + "...";
+function confidenceLabel(confidence: AuditConfidence): string {
+  switch (confidence) {
+    case "confirmed":
+      return "confirmado";
+    case "probable":
+      return "provável";
+    default:
+      return "não identificado";
+  }
 }
 
-/**
- * Busca entradas recentes no Audit Log com retry robusto.
- * Usa múltiplas tentativas com backoff progressivo para garantir
- * que o audit log tenha tempo de ser registrado pelo Discord.
- */
-async function fetchAuditLog(
-  guild: Guild,
-  type: AuditLogEvent,
-  targetId?: string,
-  retries: number = 1
-): Promise<GuildAuditLogsEntry | null> {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      // Delay progressivo: 0ms, 500ms
-      if (attempt > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
-      }
+function formatUserId(id: string): string {
+  return `<@${id}> (${id})`;
+}
 
+function getExecutor(resolution: AuditResolution) {
+  return resolution.entry?.executor ?? null;
+}
+
+function getExecutorMention(resolution: AuditResolution): string | null {
+  const executor = getExecutor(resolution);
+  return executor ? `<@${executor.id}>` : null;
+}
+
+function getExecutorDisplay(resolution: AuditResolution): string | null {
+  const executor = getExecutor(resolution);
+  if (!executor) return null;
+  return executor.tag || executor.username || executor.id;
+}
+
+function getAuditEntryChannelId(entry: GuildAuditLogsEntry): string | null {
+  const extra = entry.extra as
+    | { channel?: { id?: string | null } | null; channelId?: string | null }
+    | null
+    | undefined;
+
+  return extra?.channel?.id ?? extra?.channelId ?? null;
+}
+
+function entryDoesNotConflictWithChannel(
+  entry: GuildAuditLogsEntry,
+  channelId?: string
+): boolean {
+  if (!channelId) return true;
+
+  const entryChannelId = getAuditEntryChannelId(entry);
+  if (entryChannelId) return entryChannelId === channelId;
+  if (entry.targetId === channelId) return true;
+
+  return true;
+}
+
+function entryHasKnownChannelMatch(
+  entry: GuildAuditLogsEntry,
+  channelId?: string
+): boolean {
+  if (!channelId) return true;
+
+  const entryChannelId = getAuditEntryChannelId(entry);
+  if (entryChannelId) return entryChannelId === channelId;
+
+  return entry.targetId === channelId;
+}
+
+function chooseEntryWithSingleExecutor(
+  entries: GuildAuditLogsEntry[]
+): GuildAuditLogsEntry | null {
+  const executorIds = new Set(
+    entries.map((entry) => entry.executor?.id).filter((id): id is string => Boolean(id))
+  );
+
+  if (executorIds.size !== 1) return null;
+
+  const executorId = [...executorIds][0];
+  return (
+    entries
+      .filter((entry) => entry.executor?.id === executorId)
+      .sort((a, b) => (b.createdTimestamp ?? 0) - (a.createdTimestamp ?? 0))[0] ?? null
+  );
+}
+
+async function resolveAuditLog(
+  guild: Guild,
+  options: AuditLookupOptions
+): Promise<AuditResolution> {
+  const maxAgeMs = options.maxAgeMs ?? AUDIT_LOG_MAX_AGE_MS;
+  const retries = options.retries ?? 3;
+  const initialDelayMs = options.initialDelayMs ?? 700;
+  const retryDelayMs = options.retryDelayMs ?? 700;
+  let lastCandidates = 0;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt === 0 && initialDelayMs > 0) {
+      await delay(initialDelayMs);
+    } else if (attempt > 0) {
+      await delay(retryDelayMs * attempt);
+    }
+
+    try {
       const auditLogs = await guild.fetchAuditLogs({
-        type,
+        type: options.type,
         limit: 10,
       });
 
       const now = Date.now();
+      const recentEntries = auditLogs.entries
+        .filter((entry) => {
+          const createdTimestamp = entry.createdTimestamp ?? 0;
+          const age = now - createdTimestamp;
+          return age >= 0 && age <= maxAgeMs;
+        })
+        .sort((a, b) => (b.createdTimestamp ?? 0) - (a.createdTimestamp ?? 0));
 
-      // Primeira passagem: buscar entrada com targetId (se fornecido)
-      if (targetId) {
-        const exactMatch = auditLogs.entries.find((e) => {
-          const timeDiff = now - (e.createdTimestamp || 0);
-          if (timeDiff > 30000) return false; // 30 segundos de janela
-          return e.targetId === targetId;
-        });
-        if (exactMatch) return exactMatch;
+      lastCandidates = recentEntries.size;
+      const recent = [...recentEntries.values()];
+
+      if (options.targetId) {
+        const targetCandidates = recent.filter(
+          (entry) =>
+            entry.targetId === options.targetId &&
+            entryDoesNotConflictWithChannel(entry, options.channelId)
+        );
+        const selected = chooseEntryWithSingleExecutor(targetCandidates);
+
+        if (selected) {
+          return {
+            confidence: "confirmed",
+            entry: selected,
+            candidates: targetCandidates.length,
+            reason: "Audit log bateu com tipo, alvo, janela de tempo e executor único.",
+          };
+        }
+
+        if (targetCandidates.length > 1) {
+          return {
+            confidence: "unknown",
+            entry: null,
+            candidates: targetCandidates.length,
+            reason: "Mais de um executor possível para o mesmo alvo na janela analisada.",
+          };
+        }
       }
 
-      // Segunda passagem: buscar qualquer entrada recente do mesmo tipo
-      const recentMatch = auditLogs.entries.find((e) => {
-        const timeDiff = now - (e.createdTimestamp || 0);
-        return timeDiff <= 30000; // 30 segundos de janela
-      });
+      if (options.allowProbable) {
+        const knownChannelMatches = recent.filter((entry) =>
+          entryHasKnownChannelMatch(entry, options.channelId)
+        );
+        const hasKnownChannelData = recent.some(
+          (entry) => getAuditEntryChannelId(entry) || entry.targetId === options.channelId
+        );
+        const probableCandidates =
+          options.channelId && hasKnownChannelData ? knownChannelMatches : recent;
+        const selected = chooseEntryWithSingleExecutor(probableCandidates);
 
-      if (recentMatch) return recentMatch;
+        if (selected) {
+          return {
+            confidence: "probable",
+            entry: selected,
+            candidates: probableCandidates.length,
+            reason:
+              "Audit log recente do mesmo tipo com executor único, mas sem alvo exato exposto pelo Discord.",
+          };
+        }
+      }
     } catch (error) {
       console.error(
         `[AUDIT LOG] Erro ao buscar audit log (tentativa ${attempt + 1}/${retries + 1}):`,
@@ -152,359 +363,436 @@ async function fetchAuditLog(
     }
   }
 
+  return {
+    confidence: "unknown",
+    entry: null,
+    candidates: lastCandidates,
+    reason: "Nenhuma entrada confiável foi encontrada na janela analisada.",
+  };
+}
+
+async function resolveTextChannelById(
+  guild: Guild,
+  channelId: string
+): Promise<TextChannel | null> {
+  const cached = guild.channels.cache.get(channelId);
+  if (cached?.type === ChannelType.GuildText) return cached as TextChannel;
+
+  try {
+    const fetched = await guild.channels.fetch(channelId);
+    if (fetched?.type === ChannelType.GuildText) return fetched as TextChannel;
+  } catch (error) {
+    console.warn(`[LOG CHANNEL] Não consegui buscar o canal ${channelId} em ${guild.name}:`, error);
+  }
+
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Evento: Bot pronto
-// ─────────────────────────────────────────────────────────────────────────────
-client.once(Events.ClientReady, (readyClient) => {
+async function getLogChannel(guild: Guild): Promise<TextChannel | null> {
+  const cachedId = logChannelCache.get(guild.id);
+  if (cachedId) {
+    const cachedChannel = await resolveTextChannelById(guild, cachedId);
+    if (cachedChannel) return cachedChannel;
+    logChannelCache.delete(guild.id);
+  }
+
+  if (LOG_CHANNEL_ID) {
+    const channelById = await resolveTextChannelById(guild, LOG_CHANNEL_ID);
+    if (channelById) {
+      logChannelCache.set(guild.id, channelById.id);
+      return channelById;
+    }
+  }
+
+  const acceptedNames = new Set([LOG_CHANNEL_NAME, ...FALLBACK_LOG_CHANNEL_NAMES]);
+  const channelByName = guild.channels.cache.find(
+    (channel) =>
+      channel.type === ChannelType.GuildText && acceptedNames.has(channel.name)
+  );
+
+  if (channelByName?.type === ChannelType.GuildText) {
+    logChannelCache.set(guild.id, channelByName.id);
+    return channelByName as TextChannel;
+  }
+
+  return null;
+}
+
+async function sendLog(
+  logChannel: TextChannel,
+  payload: Parameters<TextChannel["send"]>[0],
+  context: string
+): Promise<Message<true> | null> {
+  try {
+    return await logChannel.send(payload);
+  } catch (error) {
+    console.error(`[SEND LOG] Falha ao enviar log (${context}):`, error);
+    return null;
+  }
+}
+
+async function validateLogChannel(guild: Guild): Promise<void> {
+  const logChannel = await getLogChannel(guild);
+
+  if (!logChannel) {
+    const configured = LOG_CHANNEL_ID
+      ? `ID ${LOG_CHANNEL_ID}`
+      : `nome "${LOG_CHANNEL_NAME}"`;
+    console.warn(`[READY] [${guild.name}] Canal de logs não encontrado (${configured}).`);
+    return;
+  }
+
+  let me = guild.members.me;
+  if (!me) {
+    try {
+      me = await guild.members.fetchMe();
+    } catch (error) {
+      console.warn(`[READY] [${guild.name}] Não consegui buscar o membro do bot:`, error);
+      return;
+    }
+  }
+
+  const channelPermissions = logChannel.permissionsFor(me);
+  const requiredChannelPermissions = [
+    { flag: PermissionFlagsBits.ViewChannel, name: "View Channels" },
+    { flag: PermissionFlagsBits.SendMessages, name: "Send Messages" },
+    { flag: PermissionFlagsBits.EmbedLinks, name: "Embed Links" },
+    { flag: PermissionFlagsBits.ReadMessageHistory, name: "Read Message History" },
+  ];
+
+  const missingChannelPermissions = requiredChannelPermissions
+    .filter((permission) => !channelPermissions?.has(permission.flag))
+    .map((permission) => permission.name);
+
+  console.log(`  ✅ [${guild.name}] Canal de logs: #${logChannel.name} (${logChannel.id})`);
+
+  if (missingChannelPermissions.length > 0) {
+    console.warn(
+      `  ⚠️ [${guild.name}] Permissões ausentes no canal de logs: ${missingChannelPermissions.join(
+        ", "
+      )}`
+    );
+  }
+
+  if (!me.permissions.has(PermissionFlagsBits.ViewAuditLog)) {
+    console.warn(
+      `  ⚠️ [${guild.name}] Sem permissão View Audit Log. O bot continuará logando, mas identificará menos responsáveis.`
+    );
+  }
+
+  if (!channelPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+    console.warn(
+      `  ⚠️ [${guild.name}] Sem Manage Messages em #${logChannel.name}. A limpeza automática pode falhar.`
+    );
+  }
+}
+
+function buildVoiceActorText(resolution: AuditResolution): string | null {
+  const mention = getExecutorMention(resolution);
+  if (!mention) return null;
+  return `${mention} (${confidenceLabel(resolution.confidence)} pelo Audit Log)`;
+}
+
+client.once(Events.ClientReady, async (readyClient) => {
   console.log("═══════════════════════════════════════════════════════");
   console.log(`✅ Bot conectado como: ${readyClient.user.tag}`);
   console.log(`📊 Servidores: ${readyClient.guilds.cache.size}`);
-  console.log(`📋 Canal de logs: ${LOG_CHANNEL_NAME}`);
-  console.log(`🧹 Limpeza automática: logs com mais de 5 dias`);
+  console.log(`📋 Canal de logs por ID: ${LOG_CHANNEL_ID ?? "não configurado"}`);
+  console.log(`📋 Canal de logs por nome: ${LOG_CHANNEL_NAME}`);
+  console.log(`🧹 Retenção automática: logs com mais de ${LOG_RETENTION_DAYS} dia(s)`);
   console.log("═══════════════════════════════════════════════════════");
 
-  // Verificar canais de log em todos os servidores
-  readyClient.guilds.cache.forEach((guild) => {
-    const logChannel = getLogChannel(guild);
-    if (logChannel) {
-      console.log(
-        `  ✅ [${guild.name}] Canal de logs encontrado: #${logChannel.name}`
-      );
-    } else {
-      console.warn(
-        `  ⚠️ [${guild.name}] Canal de logs "${LOG_CHANNEL_NAME}" NÃO encontrado!`
-      );
-    }
-  });
+  for (const guild of readyClient.guilds.cache.values()) {
+    await validateLogChannel(guild);
+  }
 
-  // ── Iniciar limpeza automática de logs ──
-  // Primeira limpeza após 30 segundos do boot
-  setTimeout(() => cleanupOldLogs(readyClient), 30_000);
+  setTimeout(() => {
+    void cleanupOldLogs(readyClient);
+  }, 30_000);
 
-  // Limpeza recorrente a cada 6 horas
-  setInterval(() => cleanupOldLogs(readyClient), 6 * 60 * 60 * 1000);
+  setInterval(() => {
+    void cleanupOldLogs(readyClient);
+  }, 6 * 60 * 60 * 1000);
 
   console.log("  🧹 Limpeza automática agendada (a cada 6 horas)");
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Evento: Voice State Update (entrar, sair, mover de call)
-// ─────────────────────────────────────────────────────────────────────────────
 client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceState) => {
   try {
     const guild = newState.guild || oldState.guild;
-    if (!guild) return;
-
-    const logChannel = getLogChannel(guild);
+    const logChannel = await getLogChannel(guild);
     if (!logChannel) return;
 
     const member = newState.member || oldState.member;
-    if (!member) return;
+    if (!member || member.user.bot) return;
 
-    // Ignorar bots
-    if (member.user.bot) return;
-
-    const memberTag = `${member.user.tag}`;
+    const memberTag = member.user.tag;
     const memberMention = `<@${member.user.id}>`;
     const memberAvatar = member.user.displayAvatarURL({ size: 64 });
 
-    // ── ENTROU EM UMA CALL ──
     if (!oldState.channelId && newState.channelId) {
       const embed = new EmbedBuilder()
         .setColor(0x2ecc71)
         .setAuthor({ name: memberTag, iconURL: memberAvatar })
         .setTitle("🎙️ Entrada em Canal de Voz")
         .setDescription(`${memberMention} entrou no canal de voz <#${newState.channelId}>.`)
+        .addFields({ name: "Usuário", value: formatUserId(member.user.id), inline: false })
         .setTimestamp();
 
-      await logChannel.send({ embeds: [embed] });
+      await sendLog(logChannel, { embeds: [embed] }, "voice join");
       return;
     }
 
-    // ── SAIU DE UMA CALL ──
     if (oldState.channelId && !newState.channelId) {
-      // Verificar no audit log se foi desconectado por alguém
-      let disconnectedBy: string | null = null;
-
-      try {
-        const entry = await fetchAuditLog(
-          guild,
-          AuditLogEvent.MemberDisconnect,
-          member.user.id
-        );
-
-        if (entry && entry.executor && entry.executor.id !== member.user.id) {
-          disconnectedBy = `<@${entry.executor.id}>`;
-        }
-      } catch (err) {
-        console.error("[VOICE] Erro ao verificar audit log de disconnect:", err);
-      }
+      const resolution = await resolveAuditLog(guild, {
+        type: AuditLogEvent.MemberDisconnect,
+        channelId: oldState.channelId,
+        allowProbable: true,
+      });
+      const actorText = buildVoiceActorText(resolution);
 
       const embed = new EmbedBuilder()
         .setAuthor({ name: memberTag, iconURL: memberAvatar })
+        .addFields(
+          { name: "Usuário", value: formatUserId(member.user.id), inline: false },
+          { name: "Canal", value: `<#${oldState.channelId}> (${oldState.channelId})`, inline: false }
+        )
+        .setFooter({ text: resolution.reason })
         .setTimestamp();
 
-      if (disconnectedBy) {
+      if (actorText && getExecutor(resolution)?.id !== member.user.id) {
         embed
           .setColor(0xff6b6b)
           .setTitle("🔇 Desconectado de Canal de Voz")
-          .setDescription(`${memberMention} foi desconectado do canal de voz <#${oldState.channelId}> por ${disconnectedBy}.`);
+          .setDescription(
+            `${memberMention} foi desconectado do canal de voz <#${oldState.channelId}> por ${actorText}.`
+          );
       } else {
         embed
           .setColor(0xe74c3c)
           .setTitle("🔇 Saída de Canal de Voz")
-          .setDescription(`${memberMention} saiu do canal de voz <#${oldState.channelId}>.`);
+          .setDescription(
+            `${memberMention} saiu do canal de voz <#${oldState.channelId}>. Não houve responsável confirmado no Audit Log.`
+          );
       }
 
-      await logChannel.send({ embeds: [embed] });
+      await sendLog(logChannel, { embeds: [embed] }, "voice leave");
       return;
     }
 
-    // ── MOVIDO DE CALL ──
     if (
       oldState.channelId &&
       newState.channelId &&
       oldState.channelId !== newState.channelId
     ) {
-      // Verificar no audit log quem moveu
-      let movedBy: string | null = null;
-
-      try {
-        const entry = await fetchAuditLog(
-          guild,
-          AuditLogEvent.MemberMove,
-          member.user.id
-        );
-
-        if (entry && entry.executor && entry.executor.id !== member.user.id) {
-          movedBy = `<@${entry.executor.id}>`;
-        }
-      } catch (err) {
-        console.error("[VOICE] Erro ao verificar audit log de move:", err);
-      }
+      const resolution = await resolveAuditLog(guild, {
+        type: AuditLogEvent.MemberMove,
+        channelId: newState.channelId,
+        allowProbable: true,
+      });
+      const actorText = buildVoiceActorText(resolution);
 
       const embed = new EmbedBuilder()
         .setColor(0xf39c12)
         .setAuthor({ name: memberTag, iconURL: memberAvatar })
+        .addFields(
+          { name: "Usuário", value: formatUserId(member.user.id), inline: false },
+          { name: "Origem", value: `<#${oldState.channelId}> (${oldState.channelId})`, inline: true },
+          { name: "Destino", value: `<#${newState.channelId}> (${newState.channelId})`, inline: true }
+        )
+        .setFooter({ text: resolution.reason })
         .setTimestamp();
 
-      if (movedBy) {
+      if (actorText && getExecutor(resolution)?.id !== member.user.id) {
         embed
           .setTitle("🔀 Movido entre Canais de Voz")
-          .setDescription(`${memberMention} foi movido de <#${oldState.channelId}> para <#${newState.channelId}> por ${movedBy}.`);
+          .setDescription(
+            `${memberMention} foi movido de <#${oldState.channelId}> para <#${newState.channelId}> por ${actorText}.`
+          );
       } else {
         embed
           .setTitle("🔀 Movido entre Canais de Voz")
-          .setDescription(`${memberMention} se moveu de <#${oldState.channelId}> para <#${newState.channelId}>.`);
+          .setDescription(
+            `${memberMention} se moveu de <#${oldState.channelId}> para <#${newState.channelId}>. Não houve responsável confirmado no Audit Log.`
+          );
       }
 
-      await logChannel.send({ embeds: [embed] });
-      return;
+      await sendLog(logChannel, { embeds: [embed] }, "voice move");
     }
   } catch (error) {
     console.error("[VOICE STATE UPDATE] Erro geral:", error);
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Evento: Mensagem Deletada
-// ─────────────────────────────────────────────────────────────────────────────
+const LOG_DELETE_RESPONSES = {
+  confirmed: (name: string) =>
+    `🚨 **Epa, ${name}!** Vi no Audit Log que você apagou uma log minha. Vou registrar esta ocorrência e manter tudo mais rastreável daqui pra frente.`,
+  probable: (name: string) =>
+    `🚨 **Atenção.** Uma log minha foi apagada e o Audit Log aponta **${name}** como provável responsável. Não vou cravar além do que o Discord mostrou, mas deixei registrado.`,
+  unknown: () =>
+    "🚨 **Uma log minha foi apagada.** Não consegui confirmar quem foi pelo Audit Log, então não vou acusar ninguém. A ocorrência ficou registrada mesmo assim.",
+};
 
-/**
- * Mensagens de zoeira quando alguém apaga uma log do bot.
- * O bot alterna aleatoriamente entre elas.
- */
-const LOG_DELETE_RESPONSES = [
-  // Opção 1 — Clássica e direta
-  (name: string) =>
-    `🚨 **Epa, ${name}!** Pra que tá querendo apagar minhas logs? Tá aprontando né? Eu tô de olho em você. Vou salvar tudo, viu? Pare de aprontar, caba safado! 👀`,
-  // Opção 3 — Modo detetive
-  (name: string) => {
-    const agora = new Date();
-    const hora = agora.toLocaleTimeString("pt-BR", {
-      hour: "2-digit",
-      minute: "2-digit",
-      timeZone: "America/Sao_Paulo",
-    });
-    return `🕵️ **Log de auditoria registrada.** O(A) senhor(a) **${name}** tentou apagar uma log minha às ${hora}. Acha que pode destruir provas? Eu SOU a prova. Tô de olho, safado(a)! 📋`;
-  },
-];
+function buildMessageDeleteFooter(resolution: AuditResolution, authorId?: string): string {
+  const executor = getExecutor(resolution);
+
+  if (executor && resolution.confidence !== "unknown") {
+    if (authorId && executor.id === authorId) {
+      return `Responsável: próprio autor (${confidenceLabel(resolution.confidence)})`;
+    }
+
+    return `Responsável: ${executor.tag || executor.username} (${confidenceLabel(
+      resolution.confidence
+    )})`;
+  }
+
+  return "Sem registro de moderação confiável. Provavelmente apagada pelo próprio autor ou não disponível no Audit Log.";
+}
+
+function buildAttachmentList(message: Message | PartialMessage): string | null {
+  if (!message.attachments || message.attachments.size === 0) return null;
+
+  const attachments = message.attachments.map((attachment) => {
+    const name = attachment.name || "arquivo";
+    return attachment.url ? `[${truncateText(name, 80)}](${attachment.url})` : name;
+  });
+
+  return truncateText(attachments.join("\n"), 1024);
+}
 
 client.on(Events.MessageDelete, async (message) => {
   try {
-    // Tentar fazer fetch do partial
-    if (message.partial) {
-      try {
-        console.log(
-          "[MSG DELETE] Mensagem parcial detectada - usando dados do cache"
-        );
-      } catch {
-        console.log("[MSG DELETE] Não foi possível recuperar mensagem parcial");
-        return;
-      }
+    const wasPartial = message.partial;
+    if (wasPartial) {
+      console.log(
+        "[MSG DELETE] Mensagem parcial detectada. Conteúdo/autor podem estar indisponíveis porque a mensagem não estava em cache."
+      );
     }
 
     const guild = message.guild;
     if (!guild) return;
 
-    const logChannel = getLogChannel(guild);
+    const logChannel = await getLogChannel(guild);
     if (!logChannel) return;
 
-    // ─────────────────────────────────────────────────────────────────────
-    // DETECÇÃO: Alguém apagou uma log do bot no canal de logs
-    // ─────────────────────────────────────────────────────────────────────
     if (
       message.author?.id === client.user?.id &&
       message.channel.id === logChannel.id
     ) {
-      // Se foi auto-deletada pela limpeza automática, ignorar silenciosamente
-      if (autoDeletedMessageIds.has(message.id)) {
-        autoDeletedMessageIds.delete(message.id);
-        console.log("[AUTO CLEANUP] Mensagem auto-deletada removida do cache - ignorando proteção.");
+      if (autoDeletedMessageIds.consume(message.id)) {
+        console.log("[AUTO CLEANUP] Mensagem apagada pela limpeza automática. Ignorando proteção.");
         return;
       }
 
-      // Se era uma mensagem de alerta (zoeira), ignorar silenciosamente (sem loop)
-      if (alertMessageIds.has(message.id)) {
-        alertMessageIds.delete(message.id);
-        console.log("[LOG PROTECTION] Mensagem de alerta foi apagada - ignorando (sem loop).");
+      if (alertMessageIds.consume(message.id)) {
+        console.log("[LOG PROTECTION] Mensagem de alerta apagada. Ignorando para evitar loop.");
         return;
       }
-      console.log("[LOG PROTECTION] Log do bot foi apagada! Investigando quem foi...");
 
-      // Delay para o audit log ser registrado pelo Discord
-      await new Promise((resolve) => setTimeout(resolve, 800));
+      console.log("[LOG PROTECTION] Log do bot apagada. Investigando responsável...");
 
-      let culprit: string | null = null;
-      let culpritMention: string | null = null;
+      const resolution = await resolveAuditLog(guild, {
+        type: AuditLogEvent.MessageDelete,
+        targetId: client.user?.id,
+        channelId: logChannel.id,
+        allowProbable: true,
+      });
+      const executor = getExecutor(resolution);
 
-      try {
-        // Buscar no audit log quem deletou a mensagem do bot
-        const entry = await fetchAuditLog(
-          guild,
-          AuditLogEvent.MessageDelete,
-          client.user?.id
-        );
-
-        if (entry && entry.executor) {
-          // Ignorar se foi o próprio bot que deletou (ex: limpeza automática)
-          if (entry.executor.id === client.user?.id) {
-            console.log("[LOG PROTECTION] Bot deletou a própria log - ignorando.");
-            return;
-          }
-
-          culprit = entry.executor.displayName || entry.executor.username || entry.executor.tag;
-          culpritMention = `<@${entry.executor.id}>`;
-        }
-      } catch (err) {
-        console.error("[LOG PROTECTION] Erro ao verificar audit log:", err);
+      if (executor?.id === client.user?.id) {
+        console.log("[LOG PROTECTION] O próprio bot apagou a log. Ignorando.");
+        return;
       }
 
-      // Montar a mensagem de zoeira
-      const nome = culprit || "Algum espertinho";
-      const randomIndex = Math.floor(Math.random() * LOG_DELETE_RESPONSES.length);
-      const mensagemZoeira = LOG_DELETE_RESPONSES[randomIndex](nome);
+      const culpritName = getExecutorDisplay(resolution);
+      const culpritMention = getExecutorMention(resolution);
+      const response =
+        resolution.confidence === "confirmed" && culpritName
+          ? LOG_DELETE_RESPONSES.confirmed(culpritName)
+          : resolution.confidence === "probable" && culpritName
+            ? LOG_DELETE_RESPONSES.probable(culpritName)
+            : LOG_DELETE_RESPONSES.unknown();
 
       const embed = new EmbedBuilder()
-        .setColor(0xff0000)
-        .setTitle("🚨 ALERTA: LOG APAGADA!")
-        .setDescription(mensagemZoeira)
+        .setColor(resolution.confidence === "unknown" ? 0xffa502 : 0xff0000)
+        .setTitle("🚨 ALERTA: LOG APAGADA")
+        .setDescription(response)
+        .addFields(
+          { name: "Canal", value: `<#${logChannel.id}> (${logChannel.id})`, inline: false },
+          { name: "ID da mensagem apagada", value: message.id, inline: false },
+          { name: "Confiança", value: confidenceLabel(resolution.confidence), inline: true },
+          { name: "Critério", value: truncateText(resolution.reason, 1024), inline: false }
+        )
         .setTimestamp();
 
-      if (culpritMention) {
-        embed.setFooter({
-          text: `Infrator: ${culprit} • Esta ocorrência foi registrada.`,
-        });
-      } else {
-        embed.setFooter({
-          text: "Não consegui identificar quem foi... mas estou de olho! 👁️",
+      if (culpritMention && resolution.confidence !== "unknown") {
+        embed.addFields({
+          name: resolution.confidence === "confirmed" ? "Responsável" : "Provável responsável",
+          value: `${culpritMention} (${executor?.id})`,
+          inline: false,
         });
       }
 
-      const alertMsg = await logChannel.send({
-        content: culpritMention ? `${culpritMention}` : undefined,
-        embeds: [embed],
-      });
-
-      // Salvar o ID da mensagem de alerta para não disparar proteção se apagarem ela
-      alertMessageIds.add(alertMsg.id);
-
-      console.log(
-        `[LOG PROTECTION] Mensagem de alerta enviada (ID: ${alertMsg.id}). Culpado: ${culprit || "Desconhecido"}`
+      const alertMsg = await sendLog(
+        logChannel,
+        {
+          content:
+            culpritMention && resolution.confidence !== "unknown" ? culpritMention : undefined,
+          embeds: [embed],
+        },
+        "deleted bot log alert"
       );
-      return; // Não precisa logar essa deleção novamente como log normal
+
+      if (alertMsg) alertMessageIds.add(alertMsg.id);
+      return;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // LOG NORMAL: Mensagem de outro usuário deletada em outro canal
-    // ─────────────────────────────────────────────────────────────────────
-
-    // Ignorar mensagens do canal de logs (que não são do bot)
     if (message.channel.id === logChannel.id) return;
-
-    // Ignorar bots
     if (message.author?.bot) return;
 
-    const author = message.author;
-    const content = message.content || "*[Sem conteúdo de texto]*";
+    const author = message.author ?? null;
+    const content = wasPartial
+      ? "[Conteúdo indisponível: a mensagem não estava no cache do bot]"
+      : message.content || "[Sem conteúdo de texto]";
 
-    // ── Verificar quem deletou via Audit Log (detecção robusta) ──
-    let deletedByTag: string | null = null;
-    let selfDeleted = true;
-
-    // Delay para dar tempo do Discord registrar no audit log
-    await new Promise((resolve) => setTimeout(resolve, 800));
-
-    try {
-      const entry = await fetchAuditLog(
-        guild,
-        AuditLogEvent.MessageDelete,
-        author?.id
-      );
-
-      if (entry && entry.executor && author) {
-        if (entry.executor.id !== author.id) {
-          deletedByTag = entry.executor.tag || `<@${entry.executor.id}>`;
-          selfDeleted = false;
-        }
-      }
-    } catch (err) {
-      console.error("[MSG DELETE] Erro ao verificar audit log:", err);
-    }
-
-    // ── Montar embed ──
-    const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
-    const channelMention = `<#${message.channel.id}>`;
-
-    // Footer com quem deletou
-    let footerText: string;
-    if (selfDeleted) {
-      footerText = "Apagada pelo próprio autor";
-    } else {
-      footerText = `Apagada por ${deletedByTag}`;
-    }
+    const resolution = await resolveAuditLog(guild, {
+      type: AuditLogEvent.MessageDelete,
+      targetId: author?.id,
+      channelId: message.channel.id,
+      allowProbable: !author?.id,
+    });
+    const executor = getExecutor(resolution);
+    const executorMention = getExecutorMention(resolution);
+    const footerText = buildMessageDeleteFooter(resolution, author?.id);
 
     const embed = new EmbedBuilder()
-      .setColor(selfDeleted ? 0xe74c3c : 0xff4757)
+      .setColor(executor && executor.id !== author?.id ? 0xff4757 : 0xe74c3c)
       .setTitle("📋 Mensagem Apagada")
       .addFields(
         {
-          name: "Autor:",
-          value: authorMention,
-          inline: true,
-        },
-        {
-          name: "Canal:",
-          value: channelMention,
-          inline: true,
-        },
-        {
-          name: "📋 Conteúdo",
-          value: truncateText(`\`\`\`\n${content}\n\`\`\``, 1024),
+          name: "Autor",
+          value: author ? formatUserId(author.id) : "Desconhecido (mensagem parcial ou fora do cache)",
           inline: false,
+        },
+        {
+          name: "Canal",
+          value: `<#${message.channel.id}> (${message.channel.id})`,
+          inline: false,
+        },
+        {
+          name: "ID da mensagem",
+          value: message.id,
+          inline: false,
+        },
+        {
+          name: "Conteúdo",
+          value: formatCodeBlock(content),
+          inline: false,
+        },
+        {
+          name: "Confiança do responsável",
+          value: confidenceLabel(resolution.confidence),
+          inline: true,
         }
       )
       .setFooter({ text: footerText })
@@ -517,85 +805,78 @@ client.on(Events.MessageDelete, async (message) => {
       });
     }
 
-    // Adicionar info de anexos se houver
-    if (message.attachments && message.attachments.size > 0) {
-      const attachmentList = message.attachments
-        .map((att) => att.name || "arquivo")
-        .join(", ");
+    if (executorMention && resolution.confidence !== "unknown") {
       embed.addFields({
-        name: "📎 Anexos",
-        value: truncateText(attachmentList, 1024),
+        name: executor?.id === author?.id ? "Responsável" : "Moderador responsável",
+        value: `${executorMention} (${executor?.id})`,
         inline: false,
       });
     }
 
-    await logChannel.send({ embeds: [embed] });
+    const attachmentList = buildAttachmentList(message);
+    if (attachmentList) {
+      embed.addFields({ name: "📎 Anexos", value: attachmentList, inline: false });
+    }
+
+    await sendLog(logChannel, { embeds: [embed] }, "message delete");
   } catch (error) {
     console.error("[MESSAGE DELETE] Erro geral:", error);
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Evento: Mensagens Deletadas em Bulk
-// ─────────────────────────────────────────────────────────────────────────────
 client.on(
   Events.MessageBulkDelete,
   async (messages: ReadonlyCollection<string, Message<true> | PartialMessage<true>>, channel) => {
     try {
-      const firstMsg = messages.first();
-      const guild = firstMsg?.guild;
+      const guild = (channel as { guild?: Guild }).guild ?? messages.first()?.guild;
       if (!guild) return;
 
-      const logChannel = getLogChannel(guild);
+      const logChannel = await getLogChannel(guild);
       if (!logChannel) return;
       if (channel.id === logChannel.id) return;
 
-      // Verificar quem deletou em massa
-      let deletedBy: string = "*Desconhecido*";
-      try {
-        const entry = await fetchAuditLog(
-          guild,
-          AuditLogEvent.MessageBulkDelete
-        );
-        if (entry && entry.executor) {
-          deletedBy = `<@${entry.executor.id}>`;
-        }
-      } catch (err) {
-        console.error("[BULK DELETE] Erro ao verificar audit log:", err);
-      }
+      const resolution = await resolveAuditLog(guild, {
+        type: AuditLogEvent.MessageBulkDelete,
+        channelId: channel.id,
+        allowProbable: true,
+      });
+      const executorMention = getExecutorMention(resolution);
+      const deletedBy = executorMention
+        ? `${executorMention} (${confidenceLabel(resolution.confidence)})`
+        : `não identificado (${resolution.reason})`;
 
       const embed = new EmbedBuilder()
         .setColor(0x8b0000)
         .setTitle("🗑️ Mensagens Deletadas em Massa")
-        .setDescription(`**${messages.size}** mensagens deletadas em <#${channel.id}> por ${deletedBy}.`)
+        .setDescription(`**${messages.size}** mensagens deletadas em <#${channel.id}>.`)
+        .addFields(
+          { name: "Canal", value: `<#${channel.id}> (${channel.id})`, inline: false },
+          { name: "Responsável", value: deletedBy, inline: false },
+          { name: "Confiança", value: confidenceLabel(resolution.confidence), inline: true }
+        )
+        .setFooter({ text: truncateText(resolution.reason, 2048) })
         .setTimestamp();
 
-      await logChannel.send({ embeds: [embed] });
+      await sendLog(logChannel, { embeds: [embed] }, "bulk delete");
     } catch (error) {
       console.error("[BULK DELETE] Erro geral:", error);
     }
   }
 );
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Evento: Mensagem Editada
-// ─────────────────────────────────────────────────────────────────────────────
 client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   try {
-    // Tentar resolver partials
-    if (oldMessage.partial) {
-      try {
-        await oldMessage.fetch();
-      } catch {
-        console.log("[MSG EDIT] Não foi possível buscar mensagem antiga parcial");
-      }
+    const oldContentUnavailable = oldMessage.partial;
+
+    if (oldContentUnavailable) {
+      console.log("[MSG EDIT] Conteúdo antigo indisponível: mensagem antiga parcial.");
     }
 
     if (newMessage.partial) {
       try {
         await newMessage.fetch();
       } catch {
-        console.log("[MSG EDIT] Não foi possível buscar mensagem nova parcial");
+        console.log("[MSG EDIT] Não foi possível buscar mensagem nova parcial.");
         return;
       }
     }
@@ -603,72 +884,57 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
     const guild = newMessage.guild;
     if (!guild) return;
 
-    const logChannel = getLogChannel(guild);
+    const logChannel = await getLogChannel(guild);
     if (!logChannel) return;
 
-    // Ignorar bots
     if (newMessage.author?.bot) return;
-
-    // Ignorar o próprio bot
     if (newMessage.author?.id === client.user?.id) return;
-
-    // Ignorar canal de logs
     if (newMessage.channel.id === logChannel.id) return;
 
-    // Ignorar se o conteúdo não mudou (pode ser update de embed/attachment)
-    const oldContent = oldMessage.content || "";
+    const oldContent = oldContentUnavailable ? "[Não disponível no cache]" : oldMessage.content || "";
     const newContent = newMessage.content || "";
     if (oldContent === newContent) return;
 
     const author = newMessage.author;
-    const authorMention = author ? `<@${author.id}>` : "*Desconhecido*";
-    const authorDisplay = author ? `${author.tag}` : "Desconhecido";
-
-    // Data de criação da mensagem
-    const createdAt = newMessage.createdAt;
-    const createdUnix = createdAt ? Math.floor(createdAt.getTime() / 1000) : 0;
+    const authorMention = author ? `<@${author.id}>` : "Desconhecido";
+    const authorDisplay = author ? author.tag : "Desconhecido";
+    const createdUnix = newMessage.createdAt
+      ? Math.floor(newMessage.createdAt.getTime() / 1000)
+      : 0;
 
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle("✏️ Mensagem Editada")
       .addFields(
         {
-          name: "Autor:",
-          value: `${authorMention} ( ${author?.id || "N/A"} )`,
-          inline: true,
-        },
-        {
-          name: "Canal:",
-          value: `<#${newMessage.channel.id}>`,
-          inline: true,
-        },
-        {
-          name: "ID da Mensagem:",
-          value: `${newMessage.id}`,
+          name: "Autor",
+          value: author ? `${authorMention} (${author.id})` : "Desconhecido",
           inline: false,
         },
         {
-          name: "\u200b",
-          value: `[Ir para a mensagem](${newMessage.url})`,
+          name: "Canal",
+          value: `<#${newMessage.channel.id}> (${newMessage.channel.id})`,
           inline: false,
         },
+        { name: "ID da mensagem", value: newMessage.id, inline: false },
+        { name: "Link", value: `[Ir para a mensagem](${newMessage.url})`, inline: false },
         {
           name: "📝 Antes",
-          value: truncateText(`\`\`\`\n${oldContent || "[Não disponível]"}\n\`\`\``, 1024),
+          value: formatCodeBlock(oldContent || "[Sem conteúdo anterior]"),
           inline: false,
         },
         {
           name: "✏️ Depois",
-          value: truncateText(`\`\`\`\n${newContent || "[Sem conteúdo]"}\n\`\`\``, 1024),
+          value: formatCodeBlock(newContent || "[Sem conteúdo novo]"),
           inline: false,
         },
         {
           name: "📅 Mensagem criada em",
-          value: createdUnix ? `<t:${createdUnix}:F> ( <t:${createdUnix}:R> )` : "*Desconhecido*",
+          value: createdUnix ? `<t:${createdUnix}:F> (<t:${createdUnix}:R>)` : "Desconhecido",
           inline: false,
         }
       )
-      .setFooter({ text: `Editada por: ${authorDisplay}` })
+      .setFooter({ text: `Editada pelo próprio autor: ${authorDisplay}` })
       .setTimestamp();
 
     if (author) {
@@ -678,155 +944,135 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
       });
     }
 
-    await logChannel.send({ embeds: [embed] });
+    await sendLog(logChannel, { embeds: [embed] }, "message update");
   } catch (error) {
     console.error("[MESSAGE UPDATE] Erro geral:", error);
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Limpeza automática de logs com mais de 5 dias
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Tempo de retenção das logs: 5 dias em milissegundos */
-const LOG_RETENTION_MS = 5 * 24 * 60 * 60 * 1000;
-
-/**
- * Limpa automaticamente mensagens do bot no canal de logs que têm mais de 5 dias.
- * Usa bulkDelete para mensagens com até 14 dias (limite do Discord)
- * e delete individual para mensagens mais antigas (caso raro).
- */
 async function cleanupOldLogs(readyClient: Client<true>): Promise<void> {
+  if (cleanupRunning) {
+    console.log("[AUTO CLEANUP] Limpeza já em andamento. Pulando execução sobreposta.");
+    return;
+  }
+
+  cleanupRunning = true;
   console.log("[AUTO CLEANUP] Iniciando limpeza de logs antigas...");
 
-  for (const guild of readyClient.guilds.cache.values()) {
-    try {
-      const logChannel = getLogChannel(guild);
-      if (!logChannel) continue;
+  try {
+    for (const guild of readyClient.guilds.cache.values()) {
+      try {
+        const logChannel = await getLogChannel(guild);
+        if (!logChannel) continue;
 
-      let totalDeleted = 0;
-      let lastMessageId: string | undefined;
-      let hasMore = true;
-
-      while (hasMore) {
-        // Buscar mensagens em lotes de 100 (limite da API)
-        const fetchOptions: { limit: number; before?: string } = { limit: 100 };
-        if (lastMessageId) fetchOptions.before = lastMessageId;
-
-        const messages = await logChannel.messages.fetch(fetchOptions);
-
-        if (messages.size === 0) {
-          hasMore = false;
-          break;
-        }
-
-        // Atualizar o cursor para a próxima página
-        const lastMsg = messages.last();
-        if (lastMsg) lastMessageId = lastMsg.id;
-
-        // Se a mensagem mais recente do lote já é mais nova que 7 dias,
-        // e a mais antiga também, pular para o próximo lote
-        const now = Date.now();
-
-        // Filtrar apenas mensagens do bot com mais de 7 dias
-        const oldBotMessages = messages.filter((msg) => {
-          const age = now - msg.createdTimestamp;
-          return msg.author.id === readyClient.user.id && age > LOG_RETENTION_MS;
-        });
-
-        if (oldBotMessages.size === 0) {
-          // Se não encontrou mensagens antigas neste lote, verificar se
-          // a mensagem mais antiga do lote tem menos de 7 dias
-          // (significa que não há mais mensagens antigas pra frente)
-          if (lastMsg && now - lastMsg.createdTimestamp < LOG_RETENTION_MS) {
-            hasMore = false;
-          }
+        const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+        const permissions = me ? logChannel.permissionsFor(me) : null;
+        if (!permissions?.has(PermissionFlagsBits.ManageMessages)) {
+          console.warn(
+            `[AUTO CLEANUP] [${guild.name}] Sem Manage Messages em #${logChannel.name}. Pulando limpeza.`
+          );
           continue;
         }
 
-        // Separar mensagens em: deletáveis via bulk (<14 dias) e individuais (>14 dias)
-        const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
-        const bulkDeletable = oldBotMessages.filter(
-          (msg) => now - msg.createdTimestamp < fourteenDaysMs
-        );
-        const tooOldForBulk = oldBotMessages.filter(
-          (msg) => now - msg.createdTimestamp >= fourteenDaysMs
-        );
+        let totalDeleted = 0;
+        let lastMessageId: string | undefined;
+        let hasMore = true;
 
-        // Registrar IDs no Set antes de deletar (para não disparar a proteção)
-        for (const [id] of oldBotMessages) {
-          autoDeletedMessageIds.add(id);
-        }
+        while (hasMore) {
+          const fetchOptions: { limit: number; before?: string } = { limit: 100 };
+          if (lastMessageId) fetchOptions.before = lastMessageId;
 
-        // Deletar em lote (máx 100 por vez, mín 2 para bulkDelete)
-        if (bulkDeletable.size >= 2) {
-          try {
-            await logChannel.bulkDelete(bulkDeletable);
-            totalDeleted += bulkDeletable.size;
-          } catch (err) {
-            console.error(`[AUTO CLEANUP] Erro no bulkDelete:`, err);
-            // Fallback: deletar individualmente
-            for (const [, msg] of bulkDeletable) {
-              try {
-                await msg.delete();
-                totalDeleted++;
-                // Rate limit: esperar 1 segundo entre deleções individuais
-                await new Promise((r) => setTimeout(r, 1000));
-              } catch (e) {
-                console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, e);
+          const messages = await logChannel.messages.fetch(fetchOptions);
+
+          if (messages.size === 0) {
+            hasMore = false;
+            break;
+          }
+
+          const lastMsg = messages.last();
+          if (lastMsg) lastMessageId = lastMsg.id;
+
+          const now = Date.now();
+          const oldBotMessages = messages.filter((msg) => {
+            const age = now - msg.createdTimestamp;
+            return msg.author.id === readyClient.user.id && age > LOG_RETENTION_MS;
+          });
+
+          if (oldBotMessages.size === 0) {
+            if (lastMsg && now - lastMsg.createdTimestamp < LOG_RETENTION_MS) {
+              hasMore = false;
+            }
+            continue;
+          }
+
+          const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+          const bulkDeletable = oldBotMessages.filter(
+            (msg) => now - msg.createdTimestamp < fourteenDaysMs
+          );
+          const tooOldForBulk = oldBotMessages.filter(
+            (msg) => now - msg.createdTimestamp >= fourteenDaysMs
+          );
+
+          for (const [id] of oldBotMessages) {
+            autoDeletedMessageIds.add(id);
+          }
+
+          if (bulkDeletable.size >= 2) {
+            try {
+              await logChannel.bulkDelete(bulkDeletable);
+              totalDeleted += bulkDeletable.size;
+            } catch (error) {
+              console.error("[AUTO CLEANUP] Erro no bulkDelete. Tentando delete individual:", error);
+              for (const [, msg] of bulkDeletable) {
+                try {
+                  await msg.delete();
+                  totalDeleted++;
+                  await delay(1000);
+                } catch (deleteError) {
+                  console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, deleteError);
+                }
               }
             }
+          } else if (bulkDeletable.size === 1) {
+            const msg = bulkDeletable.first()!;
+            try {
+              await msg.delete();
+              totalDeleted++;
+            } catch (error) {
+              console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, error);
+            }
           }
-        } else if (bulkDeletable.size === 1) {
-          // bulkDelete não aceita menos de 2, deletar individualmente
-          const msg = bulkDeletable.first()!;
-          try {
-            await msg.delete();
-            totalDeleted++;
-          } catch (e) {
-            console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, e);
+
+          for (const [, msg] of tooOldForBulk) {
+            try {
+              await msg.delete();
+              totalDeleted++;
+              await delay(1000);
+            } catch (error) {
+              console.error(`[AUTO CLEANUP] Erro ao deletar msg antiga ${msg.id}:`, error);
+            }
           }
+
+          await delay(2000);
         }
 
-        // Deletar mensagens muito antigas individualmente
-        for (const [, msg] of tooOldForBulk) {
-          try {
-            await msg.delete();
-            totalDeleted++;
-            // Rate limit: esperar 1 segundo entre deleções
-            await new Promise((r) => setTimeout(r, 1000));
-          } catch (e) {
-            console.error(`[AUTO CLEANUP] Erro ao deletar msg antiga ${msg.id}:`, e);
-          }
+        if (totalDeleted > 0) {
+          console.log(
+            `[AUTO CLEANUP] [${guild.name}] ${totalDeleted} log(s) antiga(s) removida(s).`
+          );
+        } else {
+          console.log(`[AUTO CLEANUP] [${guild.name}] Nenhuma log antiga encontrada.`);
         }
-
-        // Pequeno delay entre lotes para respeitar rate limits
-        await new Promise((r) => setTimeout(r, 2000));
+      } catch (error) {
+        console.error(`[AUTO CLEANUP] Erro no servidor ${guild.name}:`, error);
       }
-
-      if (totalDeleted > 0) {
-        console.log(
-          `[AUTO CLEANUP] [${guild.name}] ${totalDeleted} log(s) antiga(s) removida(s).`
-        );
-      } else {
-        console.log(`[AUTO CLEANUP] [${guild.name}] Nenhuma log antiga encontrada.`);
-      }
-
-      // Limpar IDs do Set após um tempo (segurança contra memory leak)
-      setTimeout(() => {
-        autoDeletedMessageIds.clear();
-      }, 60_000);
-    } catch (error) {
-      console.error(`[AUTO CLEANUP] Erro no servidor ${guild.name}:`, error);
     }
+  } finally {
+    cleanupRunning = false;
+    console.log("[AUTO CLEANUP] Limpeza concluída.");
   }
-
-  console.log("[AUTO CLEANUP] Limpeza concluída.");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tratamento de erros globais
-// ─────────────────────────────────────────────────────────────────────────────
 client.on(Events.Error, (error) => {
   console.error("[DISCORD.JS ERROR]", error);
 });
@@ -841,16 +1087,14 @@ process.on("unhandledRejection", (error) => {
 
 process.on("uncaughtException", (error) => {
   console.error("[UNCAUGHT EXCEPTION]", error);
+  process.exit(1);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Login
-// ─────────────────────────────────────────────────────────────────────────────
 const token = process.env.DISCORD_TOKEN;
 
 if (!token) {
   console.error("❌ DISCORD_TOKEN não encontrado no .env!");
-  console.error('   Crie um arquivo .env com: DISCORD_TOKEN=seu_token_aqui');
+  console.error("   Crie um arquivo .env com: DISCORD_TOKEN=seu_token_aqui");
   process.exit(1);
 }
 

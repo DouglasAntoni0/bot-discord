@@ -14,9 +14,13 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "ts-node": "^10.9.2",
     "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "overrides": {
+    "undici": "6.27.0"
   }
 }
