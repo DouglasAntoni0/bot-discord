@@ -186,25 +186,33 @@ function formatCodeBlock(
   return `${prefix}${truncateText(escapeCodeBlock(value), maxBodyLength)}${suffix}`;
 }
 
-function formatTimestamp(date: Date = new Date()): string {
-  const unix = Math.floor(date.getTime() / 1000);
-  return `<t:${unix}:F> (<t:${unix}:R>)`;
+
+function formatShortTime(date: Date = new Date()): string {
+  return date.toLocaleTimeString("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "America/Sao_Paulo",
+  });
 }
 
-function confidenceLabel(confidence: AuditConfidence): string {
-  switch (confidence) {
-    case "confirmed":
-      return "confirmado";
-    case "probable":
-      return "provável";
-    default:
-      return "não identificado";
-  }
+function formatSimpleFooter(action: string): string {
+  return `${action} • Hoje às ${formatShortTime()}`;
 }
 
-function formatUserId(id: string): string {
-  return `<@${id}> (${id})`;
+function formatAuthorName(user: { displayName?: string | null; username?: string; tag?: string }): string {
+  return user.displayName || user.username || user.tag || "Desconhecido";
 }
+
+function formatVoiceChannel(guild: Guild, channelId: string): string {
+  const channel = guild.channels.cache.get(channelId);
+  if (channel?.name) return `**${channel.name}**`;
+  return `<#${channelId}>`;
+}
+
+function formatTextChannel(channelId: string): string {
+  return `<#${channelId}>`;
+}
+
 
 function getExecutor(resolution: AuditResolution) {
   return resolution.entry?.executor ?? null;
@@ -488,9 +496,7 @@ async function validateLogChannel(guild: Guild): Promise<void> {
 }
 
 function buildVoiceActorText(resolution: AuditResolution): string | null {
-  const mention = getExecutorMention(resolution);
-  if (!mention) return null;
-  return `${mention} (${confidenceLabel(resolution.confidence)} pelo Audit Log)`;
+  return getExecutorMention(resolution);
 }
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -526,17 +532,18 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
     const member = newState.member || oldState.member;
     if (!member || member.user.bot) return;
 
-    const memberTag = member.user.tag;
+    const memberName = member.displayName || member.user.username;
     const memberMention = `<@${member.user.id}>`;
     const memberAvatar = member.user.displayAvatarURL({ size: 64 });
 
     if (!oldState.channelId && newState.channelId) {
       const embed = new EmbedBuilder()
         .setColor(0x2ecc71)
-        .setAuthor({ name: memberTag, iconURL: memberAvatar })
-        .setTitle("🎙️ Entrada em Canal de Voz")
-        .setDescription(`${memberMention} entrou no canal de voz <#${newState.channelId}>.`)
-        .addFields({ name: "Usuário", value: formatUserId(member.user.id), inline: false })
+        .setAuthor({ name: memberName, iconURL: memberAvatar })
+        .setTitle("🎶 Entrada em Canal de Voz")
+        .setDescription(
+          `${memberMention} entrou no canal de voz ${formatVoiceChannel(guild, newState.channelId)}.`
+        )
         .setTimestamp();
 
       await sendLog(logChannel, { embeds: [embed] }, "voice join");
@@ -550,31 +557,18 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
         allowProbable: true,
       });
       const actorText = buildVoiceActorText(resolution);
+      const wasDisconnectedByOther = actorText && getExecutor(resolution)?.id !== member.user.id;
+
+      const description = wasDisconnectedByOther
+        ? `${memberMention} foi desconectado de ${formatVoiceChannel(guild, oldState.channelId)} por ${actorText}.`
+        : `${memberMention} saiu do canal de voz ${formatVoiceChannel(guild, oldState.channelId)}.`;
 
       const embed = new EmbedBuilder()
-        .setAuthor({ name: memberTag, iconURL: memberAvatar })
-        .addFields(
-          { name: "Usuário", value: formatUserId(member.user.id), inline: false },
-          { name: "Canal", value: `<#${oldState.channelId}> (${oldState.channelId})`, inline: false }
-        )
-        .setFooter({ text: resolution.reason })
+        .setColor(wasDisconnectedByOther ? 0xff6b6b : 0xe74c3c)
+        .setAuthor({ name: memberName, iconURL: memberAvatar })
+        .setTitle("🔇 Saída de Canal de Voz")
+        .setDescription(description)
         .setTimestamp();
-
-      if (actorText && getExecutor(resolution)?.id !== member.user.id) {
-        embed
-          .setColor(0xff6b6b)
-          .setTitle("🔇 Desconectado de Canal de Voz")
-          .setDescription(
-            `${memberMention} foi desconectado do canal de voz <#${oldState.channelId}> por ${actorText}.`
-          );
-      } else {
-        embed
-          .setColor(0xe74c3c)
-          .setTitle("🔇 Saída de Canal de Voz")
-          .setDescription(
-            `${memberMention} saiu do canal de voz <#${oldState.channelId}>. Não houve responsável confirmado no Audit Log.`
-          );
-      }
 
       await sendLog(logChannel, { embeds: [embed] }, "voice leave");
       return;
@@ -591,31 +585,19 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
         allowProbable: true,
       });
       const actorText = buildVoiceActorText(resolution);
+      const wasMovedByOther = actorText && getExecutor(resolution)?.id !== member.user.id;
+      const fromChannel = formatVoiceChannel(guild, oldState.channelId);
+      const toChannel = formatVoiceChannel(guild, newState.channelId);
+      const description = wasMovedByOther
+        ? `${memberMention} foi movido de ${fromChannel} para ${toChannel} por ${actorText}.`
+        : `${memberMention} se moveu de ${fromChannel} para ${toChannel}.`;
 
       const embed = new EmbedBuilder()
-        .setColor(0xf39c12)
-        .setAuthor({ name: memberTag, iconURL: memberAvatar })
-        .addFields(
-          { name: "Usuário", value: formatUserId(member.user.id), inline: false },
-          { name: "Origem", value: `<#${oldState.channelId}> (${oldState.channelId})`, inline: true },
-          { name: "Destino", value: `<#${newState.channelId}> (${newState.channelId})`, inline: true }
-        )
-        .setFooter({ text: resolution.reason })
+        .setColor(wasMovedByOther ? 0xf39c12 : 0x3498db)
+        .setAuthor({ name: memberName, iconURL: memberAvatar })
+        .setTitle("🔀 Movido entre Canais de Voz")
+        .setDescription(description)
         .setTimestamp();
-
-      if (actorText && getExecutor(resolution)?.id !== member.user.id) {
-        embed
-          .setTitle("🔀 Movido entre Canais de Voz")
-          .setDescription(
-            `${memberMention} foi movido de <#${oldState.channelId}> para <#${newState.channelId}> por ${actorText}.`
-          );
-      } else {
-        embed
-          .setTitle("🔀 Movido entre Canais de Voz")
-          .setDescription(
-            `${memberMention} se moveu de <#${oldState.channelId}> para <#${newState.channelId}>. Não houve responsável confirmado no Audit Log.`
-          );
-      }
 
       await sendLog(logChannel, { embeds: [embed] }, "voice move");
     }
@@ -624,29 +606,18 @@ client.on(Events.VoiceStateUpdate, async (oldState: VoiceState, newState: VoiceS
   }
 });
 
-const LOG_DELETE_RESPONSES = {
-  confirmed: (name: string) =>
-    `🚨 **Epa, ${name}!** Vi no Audit Log que você apagou uma log minha. Vou registrar esta ocorrência e manter tudo mais rastreável daqui pra frente.`,
-  probable: (name: string) =>
-    `🚨 **Atenção.** Uma log minha foi apagada e o Audit Log aponta **${name}** como provável responsável. Não vou cravar além do que o Discord mostrou, mas deixei registrado.`,
-  unknown: () =>
-    "🚨 **Uma log minha foi apagada.** Não consegui confirmar quem foi pelo Audit Log, então não vou acusar ninguém. A ocorrência ficou registrada mesmo assim.",
-};
-
 function buildMessageDeleteFooter(resolution: AuditResolution, authorId?: string): string {
   const executor = getExecutor(resolution);
 
-  if (executor && resolution.confidence !== "unknown") {
-    if (authorId && executor.id === authorId) {
-      return `Responsável: próprio autor (${confidenceLabel(resolution.confidence)})`;
-    }
-
-    return `Responsável: ${executor.tag || executor.username} (${confidenceLabel(
-      resolution.confidence
-    )})`;
+  if (executor && resolution.confidence !== "unknown" && executor.id !== authorId) {
+    return formatSimpleFooter(`Apagada por ${executor.username || executor.tag || executor.id}`);
   }
 
-  return "Sem registro de moderação confiável. Provavelmente apagada pelo próprio autor ou não disponível no Audit Log.";
+  if (authorId) {
+    return formatSimpleFooter("Apagada pelo próprio autor");
+  }
+
+  return formatSimpleFooter("Responsável não identificado");
 }
 
 function buildAttachmentList(message: Message | PartialMessage): string | null {
@@ -658,6 +629,20 @@ function buildAttachmentList(message: Message | PartialMessage): string | null {
   });
 
   return truncateText(attachments.join("\n"), 1024);
+}
+
+function buildDeletedBotLogDescription(resolution: AuditResolution): string {
+  const mention = getExecutorMention(resolution);
+
+  if (mention && resolution.confidence === "confirmed") {
+    return `${mention} apagou uma log do bot.`;
+  }
+
+  if (mention && resolution.confidence === "probable") {
+    return `${mention} provavelmente apagou uma log do bot.`;
+  }
+
+  return "Uma log do bot foi apagada, mas não consegui identificar quem foi.";
 }
 
 client.on(Events.MessageDelete, async (message) => {
@@ -704,42 +689,15 @@ client.on(Events.MessageDelete, async (message) => {
         return;
       }
 
-      const culpritName = getExecutorDisplay(resolution);
-      const culpritMention = getExecutorMention(resolution);
-      const response =
-        resolution.confidence === "confirmed" && culpritName
-          ? LOG_DELETE_RESPONSES.confirmed(culpritName)
-          : resolution.confidence === "probable" && culpritName
-            ? LOG_DELETE_RESPONSES.probable(culpritName)
-            : LOG_DELETE_RESPONSES.unknown();
-
       const embed = new EmbedBuilder()
-        .setColor(resolution.confidence === "unknown" ? 0xffa502 : 0xff0000)
-        .setTitle("🚨 ALERTA: LOG APAGADA")
-        .setDescription(response)
-        .addFields(
-          { name: "Canal", value: `<#${logChannel.id}> (${logChannel.id})`, inline: false },
-          { name: "ID da mensagem apagada", value: message.id, inline: false },
-          { name: "Confiança", value: confidenceLabel(resolution.confidence), inline: true },
-          { name: "Critério", value: truncateText(resolution.reason, 1024), inline: false }
-        )
-        .setTimestamp();
-
-      if (culpritMention && resolution.confidence !== "unknown") {
-        embed.addFields({
-          name: resolution.confidence === "confirmed" ? "Responsável" : "Provável responsável",
-          value: `${culpritMention} (${executor?.id})`,
-          inline: false,
-        });
-      }
+        .setColor(0xff0000)
+        .setTitle("🚨 Log Apagada")
+        .setDescription(buildDeletedBotLogDescription(resolution))
+        .setFooter({ text: formatSimpleFooter("Ocorrência registrada") });
 
       const alertMsg = await sendLog(
         logChannel,
-        {
-          content:
-            culpritMention && resolution.confidence !== "unknown" ? culpritMention : undefined,
-          embeds: [embed],
-        },
+        { embeds: [embed] },
         "deleted bot log alert"
       );
 
@@ -752,8 +710,8 @@ client.on(Events.MessageDelete, async (message) => {
 
     const author = message.author ?? null;
     const content = wasPartial
-      ? "[Conteúdo indisponível: a mensagem não estava no cache do bot]"
-      : message.content || "[Sem conteúdo de texto]";
+      ? "[conteúdo indisponível]"
+      : message.content || "[sem conteúdo de texto]";
 
     const resolution = await resolveAuditLog(guild, {
       type: AuditLogEvent.MessageDelete,
@@ -762,53 +720,33 @@ client.on(Events.MessageDelete, async (message) => {
       allowProbable: !author?.id,
     });
     const executor = getExecutor(resolution);
-    const executorMention = getExecutorMention(resolution);
     const footerText = buildMessageDeleteFooter(resolution, author?.id);
 
     const embed = new EmbedBuilder()
-      .setColor(executor && executor.id !== author?.id ? 0xff4757 : 0xe74c3c)
-      .setTitle("📋 Mensagem Apagada")
-      .addFields(
-        {
-          name: "Autor",
-          value: author ? formatUserId(author.id) : "Desconhecido (mensagem parcial ou fora do cache)",
-          inline: false,
-        },
-        {
-          name: "Canal",
-          value: `<#${message.channel.id}> (${message.channel.id})`,
-          inline: false,
-        },
-        {
-          name: "ID da mensagem",
-          value: message.id,
-          inline: false,
-        },
-        {
-          name: "Conteúdo",
-          value: formatCodeBlock(content),
-          inline: false,
-        },
-        {
-          name: "Confiança do responsável",
-          value: confidenceLabel(resolution.confidence),
-          inline: true,
-        }
+      .setColor(0xf39c12)
+      .setTitle("🗑️ Mensagem Apagada")
+      .setDescription(
+        `**Autor:** ${author ? `<@${author.id}>` : "Desconhecido"}\n` +
+          `**Canal:** ${formatTextChannel(message.channel.id)}`
       )
-      .setFooter({ text: footerText })
-      .setTimestamp();
+      .addFields({
+        name: "📝 Conteúdo",
+        value: formatCodeBlock(content),
+        inline: false,
+      })
+      .setFooter({ text: footerText });
 
     if (author) {
       embed.setAuthor({
-        name: author.tag,
+        name: formatAuthorName(author),
         iconURL: author.displayAvatarURL({ size: 64 }),
       });
     }
 
-    if (executorMention && resolution.confidence !== "unknown") {
+    if (executor && resolution.confidence !== "unknown" && executor.id !== author?.id) {
       embed.addFields({
-        name: executor?.id === author?.id ? "Responsável" : "Moderador responsável",
-        value: `${executorMention} (${executor?.id})`,
+        name: "🔍 Apagada por",
+        value: `<@${executor.id}>`,
         inline: false,
       });
     }
@@ -840,22 +778,16 @@ client.on(
         channelId: channel.id,
         allowProbable: true,
       });
-      const executorMention = getExecutorMention(resolution);
-      const deletedBy = executorMention
-        ? `${executorMention} (${confidenceLabel(resolution.confidence)})`
-        : `não identificado (${resolution.reason})`;
+      const executorMention =
+        resolution.confidence !== "unknown" ? getExecutorMention(resolution) : null;
+      const responsibleText = executorMention ?? "Responsável não identificado";
 
       const embed = new EmbedBuilder()
         .setColor(0x8b0000)
         .setTitle("🗑️ Mensagens Deletadas em Massa")
-        .setDescription(`**${messages.size}** mensagens deletadas em <#${channel.id}>.`)
-        .addFields(
-          { name: "Canal", value: `<#${channel.id}> (${channel.id})`, inline: false },
-          { name: "Responsável", value: deletedBy, inline: false },
-          { name: "Confiança", value: confidenceLabel(resolution.confidence), inline: true }
-        )
-        .setFooter({ text: truncateText(resolution.reason, 2048) })
-        .setTimestamp();
+        .setDescription(`**${messages.size}** mensagens foram apagadas em ${formatTextChannel(channel.id)}.`)
+        .addFields({ name: "Responsável", value: responsibleText, inline: false })
+        .setFooter({ text: formatSimpleFooter("Limpeza registrada") });
 
       await sendLog(logChannel, { embeds: [embed] }, "bulk delete");
     } catch (error) {
@@ -897,27 +829,19 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
 
     const author = newMessage.author;
     const authorMention = author ? `<@${author.id}>` : "Desconhecido";
-    const authorDisplay = author ? author.tag : "Desconhecido";
-    const createdUnix = newMessage.createdAt
-      ? Math.floor(newMessage.createdAt.getTime() / 1000)
-      : 0;
+    const authorDisplay = author ? formatAuthorName(author) : "Desconhecido";
+    const authorUsername = author?.username || author?.tag || "Desconhecido";
 
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle("✏️ Mensagem Editada")
+      .setDescription(
+        `**Autor:** ${author ? authorMention : "Desconhecido"}\n` +
+          `**Canal:** ${formatTextChannel(newMessage.channel.id)}\n` +
+          `**ID da Mensagem:** ${newMessage.id}\n` +
+          `**[Ir para a mensagem](${newMessage.url})**`
+      )
       .addFields(
-        {
-          name: "Autor",
-          value: author ? `${authorMention} (${author.id})` : "Desconhecido",
-          inline: false,
-        },
-        {
-          name: "Canal",
-          value: `<#${newMessage.channel.id}> (${newMessage.channel.id})`,
-          inline: false,
-        },
-        { name: "ID da mensagem", value: newMessage.id, inline: false },
-        { name: "Link", value: `[Ir para a mensagem](${newMessage.url})`, inline: false },
         {
           name: "📝 Antes",
           value: formatCodeBlock(oldContent || "[Sem conteúdo anterior]"),
@@ -927,19 +851,13 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
           name: "✏️ Depois",
           value: formatCodeBlock(newContent || "[Sem conteúdo novo]"),
           inline: false,
-        },
-        {
-          name: "📅 Mensagem criada em",
-          value: createdUnix ? `<t:${createdUnix}:F> (<t:${createdUnix}:R>)` : "Desconhecido",
-          inline: false,
         }
       )
-      .setFooter({ text: `Editada pelo próprio autor: ${authorDisplay}` })
-      .setTimestamp();
+      .setFooter({ text: formatSimpleFooter(`Editada por: ${authorUsername}`) });
 
     if (author) {
       embed.setAuthor({
-        name: `${author.displayName} (${author.tag})`,
+        name: `${authorDisplay} (${authorUsername})`,
         iconURL: author.displayAvatarURL({ size: 64 }),
       });
     }
