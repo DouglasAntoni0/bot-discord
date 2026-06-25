@@ -631,18 +631,17 @@ function buildAttachmentList(message: Message | PartialMessage): string | null {
   return truncateText(attachments.join("\n"), 1024);
 }
 
+const LOG_DELETE_RESPONSES = [
+  (name: string) =>
+    `🚨 **Epa, ${name}!** Pra que tá querendo apagar minhas logs? Tá aprontando né? Eu tô de olho em você. Vou salvar tudo, viu? Pare de aprontar, caba safado! 👀`,
+  (name: string) =>
+    `🕵️ **Log de auditoria registrada.** O(A) senhor(a) **${name}** tentou apagar uma log minha às ${formatShortTime()}. Acha que pode destruir provas? Eu SOU a prova. Tô de olho, safado(a)! 📋`,
+];
+
 function buildDeletedBotLogDescription(resolution: AuditResolution): string {
-  const mention = getExecutorMention(resolution);
-
-  if (mention && resolution.confidence === "confirmed") {
-    return `${mention} apagou uma log do bot.`;
-  }
-
-  if (mention && resolution.confidence === "probable") {
-    return `${mention} provavelmente apagou uma log do bot.`;
-  }
-
-  return "Uma log do bot foi apagada, mas não consegui identificar quem foi.";
+  const culprit = getExecutorDisplay(resolution) ?? "Algum espertinho";
+  const randomIndex = Math.floor(Math.random() * LOG_DELETE_RESPONSES.length);
+  return LOG_DELETE_RESPONSES[randomIndex](culprit);
 }
 
 client.on(Events.MessageDelete, async (message) => {
