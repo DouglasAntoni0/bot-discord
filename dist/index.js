@@ -37,6 +37,7 @@ const LOG_RETENTION_MS = LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const AUDIT_LOG_MAX_AGE_MS = 30_000;
 const TRACKED_DELETE_TTL_MS = 10 * 60 * 1000;
 const logChannelCache = new Map();
+const voiceSessionStartTimes = new Map();
 let cleanupRunning = false;
 class ExpiringIdSet {
     defaultTtlMs;
@@ -142,6 +143,70 @@ function formatVoiceChannel(guild, channelId) {
 }
 function formatTextChannel(channelId) {
     return `<#${channelId}>`;
+}
+function getVoiceSessionKey(guildId, userId) {
+    return `${guildId}:${userId}`;
+}
+function startVoiceSession(guildId, userId, startedAt = Date.now()) {
+    voiceSessionStartTimes.set(getVoiceSessionKey(guildId, userId), startedAt);
+}
+function ensureVoiceSession(guildId, userId) {
+    const key = getVoiceSessionKey(guildId, userId);
+    if (!voiceSessionStartTimes.has(key)) {
+        voiceSessionStartTimes.set(key, Date.now());
+    }
+}
+function consumeVoiceSessionDuration(guildId, userId) {
+    const key = getVoiceSessionKey(guildId, userId);
+    const startedAt = voiceSessionStartTimes.get(key) ?? Date.now();
+    voiceSessionStartTimes.delete(key);
+    return Math.max(1000, Date.now() - startedAt);
+}
+function formatDurationPart(value, singular, plural) {
+    return `${value} ${value === 1 ? singular : plural}`;
+}
+function joinDurationParts(parts) {
+    if (parts.length <= 1)
+        return parts[0] ?? "1 segundo";
+    return `${parts.slice(0, -1).join(", ")} e ${parts[parts.length - 1]}`;
+}
+function formatVoiceDuration(durationMs) {
+    const totalSeconds = Math.max(1, Math.floor(durationMs / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) {
+        const parts = [formatDurationPart(hours, "hora", "horas")];
+        if (minutes > 0)
+            parts.push(formatDurationPart(minutes, "minuto", "minutos"));
+        return joinDurationParts(parts);
+    }
+    if (minutes > 0) {
+        const parts = [formatDurationPart(minutes, "minuto", "minutos")];
+        if (seconds > 0)
+            parts.push(formatDurationPart(seconds, "segundo", "segundos"));
+        return joinDurationParts(parts);
+    }
+    return formatDurationPart(seconds, "segundo", "segundos");
+}
+function buildVoiceGossipDuration(durationMs) {
+    return `Ele ficou fofocando por ${formatVoiceDuration(durationMs)}.`;
+}
+function initializeActiveVoiceSessions(readyClient) {
+    const startedAt = Date.now();
+    let trackedSessions = 0;
+    for (const guild of readyClient.guilds.cache.values()) {
+        for (const voiceState of guild.voiceStates.cache.values()) {
+            const member = voiceState.member;
+            if (!voiceState.channelId || !member || member.user.bot)
+                continue;
+            startVoiceSession(guild.id, member.user.id, startedAt);
+            trackedSessions++;
+        }
+    }
+    if (trackedSessions > 0) {
+        console.log(`[VOICE] ${trackedSessions} sessão(ões) de voz ativa(s) rastreada(s) a partir do boot.`);
+    }
 }
 function getExecutor(resolution) {
     return resolution.entry?.executor ?? null;
@@ -362,6 +427,7 @@ client.once(discord_js_1.Events.ClientReady, async (readyClient) => {
     for (const guild of readyClient.guilds.cache.values()) {
         await validateLogChannel(guild);
     }
+    initializeActiveVoiceSessions(readyClient);
     setTimeout(() => {
         void cleanupOldLogs(readyClient);
     }, 30_000);
@@ -383,6 +449,7 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
         const memberMention = `<@${member.user.id}>`;
         const memberAvatar = member.user.displayAvatarURL({ size: 64 });
         if (!oldState.channelId && newState.channelId) {
+            startVoiceSession(guild.id, member.user.id);
             const embed = new discord_js_1.EmbedBuilder()
                 .setColor(0x2ecc71)
                 .setAuthor({ name: memberName, iconURL: memberAvatar })
@@ -393,6 +460,7 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
             return;
         }
         if (oldState.channelId && !newState.channelId) {
+            const durationMs = consumeVoiceSessionDuration(guild.id, member.user.id);
             const resolution = await resolveAuditLog(guild, {
                 type: discord_js_1.AuditLogEvent.MemberDisconnect,
                 channelId: oldState.channelId,
@@ -400,9 +468,10 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
             });
             const actorText = buildVoiceActorText(resolution);
             const wasDisconnectedByOther = actorText && getExecutor(resolution)?.id !== member.user.id;
+            const channelText = formatVoiceChannel(guild, oldState.channelId);
             const description = wasDisconnectedByOther
-                ? `${memberMention} foi desconectado de ${formatVoiceChannel(guild, oldState.channelId)} por ${actorText}.`
-                : `${memberMention} saiu do canal de voz ${formatVoiceChannel(guild, oldState.channelId)}.`;
+                ? `${memberMention} foi desconectado de ${channelText} por ${actorText}.\n\n${buildVoiceGossipDuration(durationMs)}`
+                : `${memberMention} saiu do canal de voz ${channelText}.\n\n${buildVoiceGossipDuration(durationMs)}`;
             const embed = new discord_js_1.EmbedBuilder()
                 .setColor(wasDisconnectedByOther ? 0xff6b6b : 0xe74c3c)
                 .setAuthor({ name: memberName, iconURL: memberAvatar })
@@ -415,6 +484,7 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
         if (oldState.channelId &&
             newState.channelId &&
             oldState.channelId !== newState.channelId) {
+            ensureVoiceSession(guild.id, member.user.id);
             const resolution = await resolveAuditLog(guild, {
                 type: discord_js_1.AuditLogEvent.MemberMove,
                 channelId: newState.channelId,
@@ -425,8 +495,8 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
             const fromChannel = formatVoiceChannel(guild, oldState.channelId);
             const toChannel = formatVoiceChannel(guild, newState.channelId);
             const description = wasMovedByOther
-                ? `${memberMention} foi movido de ${fromChannel} para ${toChannel} por ${actorText}.`
-                : `${memberMention} se moveu de ${fromChannel} para ${toChannel}.`;
+                ? `${memberMention} foi movido por ${actorText} de ${fromChannel} para ${toChannel}. A fofoca deve estar boa.`
+                : `${memberMention} se moveu de ${fromChannel} para ${toChannel}. Com certeza está aprontando.`;
             const embed = new discord_js_1.EmbedBuilder()
                 .setColor(wasMovedByOther ? 0xf39c12 : 0x3498db)
                 .setAuthor({ name: memberName, iconURL: memberAvatar })
