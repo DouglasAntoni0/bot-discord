@@ -24,10 +24,11 @@ Bot de Discord em TypeScript com discord.js v14 para registrar eventos de voz, m
 - Logs apagadas pela limpeza automática são ignoradas pela proteção.
 
 ### Limpeza automática
-- Remove mensagens antigas do próprio bot no canal de logs.
-- Retenção configurável por `LOG_RETENTION_DAYS`.
-- Evita execuções sobrepostas.
-- Usa rastreamento com TTL por mensagem para não limpar o estado inteiro de proteção.
+- Agenda cada mensagem do próprio bot para expirar no instante configurado.
+- Reconcilia todo o histórico ao iniciar e a cada hora, inclusive após reinícios.
+- Retenção configurável por `LOG_RETENTION_DAYS`, com padrão de 7 dias.
+- Preserva mensagens de outros autores e evita execuções sobrepostas.
+- Usa rastreamento com TTL por mensagem para não disparar alertas falsos.
 
 ## Configuração
 
@@ -37,12 +38,12 @@ Crie um arquivo `.env` na raiz do projeto:
 DISCORD_TOKEN=seu_token_aqui
 LOG_CHANNEL_ID=123456789012345678
 LOG_CHANNEL_NAME=📜logs
-LOG_RETENTION_DAYS=5
+LOG_RETENTION_DAYS=7
 ```
 
 `LOG_CHANNEL_ID` é a forma recomendada, porque continua funcionando mesmo se o canal for renomeado. Se ele ficar vazio, o bot procura por `LOG_CHANNEL_NAME` e alguns nomes comuns como `logs`, `📜-logs` e `📜│logs`.
 
-`LOG_RETENTION_DAYS` aceita valores de 1 a 90. Se ficar vazio, o padrão é 5 dias.
+`LOG_RETENTION_DAYS` aceita valores de 1 a 90. Se ficar vazio, o padrão é 7 dias.
 
 ## Permissões necessárias
 
@@ -53,7 +54,7 @@ No servidor/canal de logs, o bot precisa de:
 - Embed Links
 - Read Message History
 - View Audit Log
-- Manage Messages, apenas para a limpeza automática
+- Manage Messages, opcional: permite acelerar a recuperação de atrasados com exclusão em lote
 
 No Discord Developer Portal, habilite os intents privilegiados necessários:
 
@@ -96,7 +97,7 @@ Essa política reduz acusações falsas e deixa claro quando o bot está inferin
 
 O projeto inclui `discloud.config` e usa `dist/index.js` como arquivo principal.
 
-Configure o segredo `DISCORD_TOKEN` no painel da Discloud. Se possível, configure também `LOG_CHANNEL_ID` e `LOG_RETENTION_DAYS`.
+Configure o segredo `DISCORD_TOKEN` no painel da Discloud. Se possível, configure também `LOG_CHANNEL_ID`. Para retenção de 7 dias, defina `LOG_RETENTION_DAYS=7` ou remova um valor antigo para usar o padrão.
 
 ## Segurança
 

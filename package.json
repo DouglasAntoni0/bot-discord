@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "test": "npm run build && node --test-isolation=none --test tests/*.test.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",

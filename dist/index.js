@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const discord_js_1 = require("discord.js");
 const dotenv_1 = require("dotenv");
+const logRetention_1 = require("./logRetention");
 (0, dotenv_1.config)();
 const client = new discord_js_1.Client({
     intents: [
@@ -32,8 +33,10 @@ const FALLBACK_LOG_CHANNEL_NAMES = [
 ];
 const LOG_CHANNEL_NAME = readTextEnv("LOG_CHANNEL_NAME", DEFAULT_LOG_CHANNEL_NAME);
 const LOG_CHANNEL_ID = readSnowflakeEnv("LOG_CHANNEL_ID");
-const LOG_RETENTION_DAYS = readIntegerEnv("LOG_RETENTION_DAYS", 5, 1, 90);
+const LOG_RETENTION_DAYS = readIntegerEnv("LOG_RETENTION_DAYS", 7, 1, 90);
 const LOG_RETENTION_MS = LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const LOG_RECONCILIATION_INTERVAL_MS = 60 * 60 * 1000;
+const DISCORD_BULK_DELETE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const AUDIT_LOG_MAX_AGE_MS = 30_000;
 const TRACKED_DELETE_TTL_MS = 10 * 60 * 1000;
 const logChannelCache = new Map();
@@ -71,6 +74,21 @@ class ExpiringIdSet {
 }
 const autoDeletedMessageIds = new ExpiringIdSet(TRACKED_DELETE_TTL_MS);
 const alertMessageIds = new ExpiringIdSet(TRACKED_DELETE_TTL_MS);
+function isUnknownMessageError(error) {
+    if (!error || typeof error !== "object" || !("code" in error))
+        return false;
+    return error.code === 10008;
+}
+const logRetentionManager = new logRetention_1.LogRetentionManager({
+    retentionMs: LOG_RETENTION_MS,
+    retryDelayMs: 60_000,
+    markAutomaticDelete: (messageId) => autoDeletedMessageIds.add(messageId),
+    unmarkAutomaticDelete: (messageId) => autoDeletedMessageIds.delete(messageId),
+    isMissingMessageError: isUnknownMessageError,
+    onDeleteError: (messageId, error) => {
+        console.error(`[AUTO CLEANUP] Erro ao deletar msg ${messageId}. Nova tentativa em 60 segundos:`, error);
+    },
+});
 function readTextEnv(name, defaultValue) {
     const value = process.env[name]?.trim();
     return value && value.length > 0 ? value : defaultValue;
@@ -366,7 +384,9 @@ async function getLogChannel(guild) {
 }
 async function sendLog(logChannel, payload, context) {
     try {
-        return await logChannel.send(payload);
+        const message = await logChannel.send(payload);
+        logRetentionManager.schedule(message);
+        return message;
     }
     catch (error) {
         console.error(`[SEND LOG] Falha ao enviar log (${context}):`, error);
@@ -410,7 +430,7 @@ async function validateLogChannel(guild) {
         console.warn(`  ⚠️ [${guild.name}] Sem permissão View Audit Log. O bot continuará logando, mas identificará menos responsáveis.`);
     }
     if (!channelPermissions?.has(discord_js_1.PermissionFlagsBits.ManageMessages)) {
-        console.warn(`  ⚠️ [${guild.name}] Sem Manage Messages em #${logChannel.name}. A limpeza automática pode falhar.`);
+        console.log(`  ℹ️ [${guild.name}] Sem Manage Messages em #${logChannel.name}. A limpeza usará exclusões individuais.`);
     }
 }
 function buildVoiceActorText(resolution) {
@@ -428,13 +448,11 @@ client.once(discord_js_1.Events.ClientReady, async (readyClient) => {
         await validateLogChannel(guild);
     }
     initializeActiveVoiceSessions(readyClient);
-    setTimeout(() => {
-        void cleanupOldLogs(readyClient);
-    }, 30_000);
+    void cleanupOldLogs(readyClient);
     setInterval(() => {
         void cleanupOldLogs(readyClient);
-    }, 6 * 60 * 60 * 1000);
-    console.log("  🧹 Limpeza automática agendada (a cada 6 horas)");
+    }, LOG_RECONCILIATION_INTERVAL_MS);
+    console.log("  🧹 Expiração individual ativa; reconciliação de segurança a cada 1 hora");
 });
 client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
     try {
@@ -552,6 +570,7 @@ client.on(discord_js_1.Events.MessageDelete, async (message) => {
             return;
         if (message.author?.id === client.user?.id &&
             message.channel.id === logChannel.id) {
+            logRetentionManager.cancel(message.id);
             if (autoDeletedMessageIds.consume(message.id)) {
                 console.log("[AUTO CLEANUP] Mensagem apagada pela limpeza automática. Ignorando proteção.");
                 return;
@@ -725,13 +744,45 @@ client.on(discord_js_1.Events.MessageUpdate, async (oldMessage, newMessage) => {
         console.error("[MESSAGE UPDATE] Erro geral:", error);
     }
 });
+async function deleteExpiredBotMessages(logChannel, expiredMessages, canBulkDelete) {
+    const now = Date.now();
+    const bulkEligible = expiredMessages.filter((message) => now - message.createdTimestamp < DISCORD_BULK_DELETE_MAX_AGE_MS);
+    const individualMessages = expiredMessages.filter((message) => now - message.createdTimestamp >= DISCORD_BULK_DELETE_MAX_AGE_MS);
+    let deletedCount = 0;
+    if (canBulkDelete && bulkEligible.length >= 2) {
+        for (const message of bulkEligible) {
+            logRetentionManager.cancel(message.id);
+            autoDeletedMessageIds.add(message.id);
+        }
+        try {
+            await logChannel.bulkDelete(bulkEligible);
+            deletedCount += bulkEligible.length;
+        }
+        catch (error) {
+            console.error("[AUTO CLEANUP] Erro no bulkDelete. Tentando exclusão individual:", error);
+            for (const message of bulkEligible) {
+                autoDeletedMessageIds.delete(message.id);
+            }
+            individualMessages.push(...bulkEligible);
+        }
+    }
+    else {
+        individualMessages.push(...bulkEligible);
+    }
+    for (const message of individualMessages) {
+        if (await logRetentionManager.deleteNow(message)) {
+            deletedCount++;
+        }
+    }
+    return deletedCount;
+}
 async function cleanupOldLogs(readyClient) {
     if (cleanupRunning) {
         console.log("[AUTO CLEANUP] Limpeza já em andamento. Pulando execução sobreposta.");
         return;
     }
     cleanupRunning = true;
-    console.log("[AUTO CLEANUP] Iniciando limpeza de logs antigas...");
+    console.log("[AUTO CLEANUP] Reconciliando retenção das logs...");
     try {
         for (const guild of readyClient.guilds.cache.values()) {
             try {
@@ -740,89 +791,29 @@ async function cleanupOldLogs(readyClient) {
                     continue;
                 const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
                 const permissions = me ? logChannel.permissionsFor(me) : null;
-                if (!permissions?.has(discord_js_1.PermissionFlagsBits.ManageMessages)) {
-                    console.warn(`[AUTO CLEANUP] [${guild.name}] Sem Manage Messages em #${logChannel.name}. Pulando limpeza.`);
-                    continue;
-                }
+                const canBulkDelete = permissions?.has(discord_js_1.PermissionFlagsBits.ManageMessages) ?? false;
                 let totalDeleted = 0;
-                let lastMessageId;
-                let hasMore = true;
-                while (hasMore) {
-                    const fetchOptions = { limit: 100 };
-                    if (lastMessageId)
-                        fetchOptions.before = lastMessageId;
-                    const messages = await logChannel.messages.fetch(fetchOptions);
-                    if (messages.size === 0) {
-                        hasMore = false;
-                        break;
-                    }
-                    const lastMsg = messages.last();
-                    if (lastMsg)
-                        lastMessageId = lastMsg.id;
-                    const now = Date.now();
-                    const oldBotMessages = messages.filter((msg) => {
-                        const age = now - msg.createdTimestamp;
-                        return msg.author.id === readyClient.user.id && age > LOG_RETENTION_MS;
-                    });
-                    if (oldBotMessages.size === 0) {
-                        if (lastMsg && now - lastMsg.createdTimestamp < LOG_RETENTION_MS) {
-                            hasMore = false;
-                        }
-                        continue;
-                    }
-                    const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
-                    const bulkDeletable = oldBotMessages.filter((msg) => now - msg.createdTimestamp < fourteenDaysMs);
-                    const tooOldForBulk = oldBotMessages.filter((msg) => now - msg.createdTimestamp >= fourteenDaysMs);
-                    for (const [id] of oldBotMessages) {
-                        autoDeletedMessageIds.add(id);
-                    }
-                    if (bulkDeletable.size >= 2) {
-                        try {
-                            await logChannel.bulkDelete(bulkDeletable);
-                            totalDeleted += bulkDeletable.size;
-                        }
-                        catch (error) {
-                            console.error("[AUTO CLEANUP] Erro no bulkDelete. Tentando delete individual:", error);
-                            for (const [, msg] of bulkDeletable) {
-                                try {
-                                    await msg.delete();
-                                    totalDeleted++;
-                                    await delay(1000);
-                                }
-                                catch (deleteError) {
-                                    console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, deleteError);
-                                }
+                let totalScheduled = 0;
+                await (0, logRetention_1.walkMessageHistory)({
+                    fetchPage: async (before) => {
+                        const fetchOptions = { limit: 100 };
+                        if (before)
+                            fetchOptions.before = before;
+                        const messages = await logChannel.messages.fetch(fetchOptions);
+                        return [...messages.values()];
+                    },
+                    handlePage: async (messages) => {
+                        const { active: activeMessages, expired: expiredMessages } = (0, logRetention_1.partitionOwnedMessages)(messages, readyClient.user.id, Date.now(), LOG_RETENTION_MS);
+                        for (const message of activeMessages) {
+                            if (!logRetentionManager.isScheduled(message.id)) {
+                                totalScheduled++;
                             }
+                            logRetentionManager.schedule(message);
                         }
-                    }
-                    else if (bulkDeletable.size === 1) {
-                        const msg = bulkDeletable.first();
-                        try {
-                            await msg.delete();
-                            totalDeleted++;
-                        }
-                        catch (error) {
-                            console.error(`[AUTO CLEANUP] Erro ao deletar msg ${msg.id}:`, error);
-                        }
-                    }
-                    for (const [, msg] of tooOldForBulk) {
-                        try {
-                            await msg.delete();
-                            totalDeleted++;
-                            await delay(1000);
-                        }
-                        catch (error) {
-                            console.error(`[AUTO CLEANUP] Erro ao deletar msg antiga ${msg.id}:`, error);
-                        }
-                    }
-                    await delay(2000);
-                }
-                if (totalDeleted > 0) {
-                    console.log(`[AUTO CLEANUP] [${guild.name}] ${totalDeleted} log(s) antiga(s) removida(s).`);
-                }
-                else {
-                    console.log(`[AUTO CLEANUP] [${guild.name}] Nenhuma log antiga encontrada.`);
-                }
+                        totalDeleted += await deleteExpiredBotMessages(logChannel, expiredMessages, canBulkDelete);
+                    },
+                });
+                console.log(`[AUTO CLEANUP] [${guild.name}] ${totalDeleted} removida(s), ${totalScheduled} agendada(s).`);
             }
             catch (error) {
                 console.error(`[AUTO CLEANUP] Erro no servidor ${guild.name}:`, error);
@@ -831,7 +822,7 @@ async function cleanupOldLogs(readyClient) {
     }
     finally {
         cleanupRunning = false;
-        console.log("[AUTO CLEANUP] Limpeza concluída.");
+        console.log("[AUTO CLEANUP] Reconciliação concluída.");
     }
 }
 client.on(discord_js_1.Events.Error, (error) => {
