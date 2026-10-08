@@ -32,9 +32,12 @@ Bot de Discord em TypeScript com discord.js v14 para registrar eventos de voz, m
 
 ### Comando `/falar` (somente administradores)
 - Faz o bot enviar uma mensagem como se fosse ele. Ninguém vê quem usou o comando: a confirmação aparece só para você.
-- `mensagem`: o texto. Use `\n` para quebrar linha. Se deixar vazio, abre uma janela onde dá para escrever em várias linhas.
+- `mensagem`: o texto. Use `\n` para quebrar linha. Se deixar vazio, abre uma janela onde dá para escrever em várias linhas (aceita markdown: `### subtítulo`, `- lista`, `**negrito**`...).
+- `estilo`: **Caixinha** (padrão: caixa com título, divisórias e menções em letra pequena no rodapé) ou **Texto normal**.
+- `titulo`: título grande no topo (ex.: `📄 Changelog - 02.10`).
+- `cor`: cor da faixa lateral da caixinha (padrão: sem cor).
 - `mencao`: Nenhuma, `@everyone` ou `@here`.
-- `cargo` / `usuario`: menciona um cargo e/ou um usuário no começo da mensagem.
+- `cargo` / `usuario`: menciona um cargo e/ou um usuário.
 - `canal`: canal de destino. Se não escolher, usa o canal atual.
 - O comando fica oculto para quem não é administrador e a permissão também é verificada quando ele é usado.
 - Para usar `@everyone`/`@here`, o bot precisa da permissão **Mencionar @everyone, @here e todos os cargos**.

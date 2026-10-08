@@ -3,14 +3,17 @@ import {
   ChannelType,
   ChatInputCommandInteraction,
   Client,
+  ContainerBuilder,
   Events,
   Guild,
   GuildTextBasedChannel,
+  MessageCreateOptions,
   MessageFlags,
   MessageMentionTypes,
   ModalBuilder,
   ModalSubmitInteraction,
   PermissionFlagsBits,
+  SeparatorSpacingSize,
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -21,21 +24,40 @@ import {
  * - Apenas administradores podem usar (escondido para os demais e verificado em runtime).
  * - A resposta ao admin é efêmera, então ninguém vê quem enviou.
  * - Permite mencionar @everyone, @here, um cargo e/ou um usuário.
+ * - Estilo "caixinha" usa os Components V2 do Discord (container com título, divisórias e rodapé).
  */
 
 export const SAY_COMMAND_NAME = "falar";
 const MODAL_PREFIX = `${SAY_COMMAND_NAME}:`;
 const MODAL_MESSAGE_INPUT_ID = "mensagem";
-const DISCORD_MESSAGE_MAX_LENGTH = 2000;
+const MODAL_TITLE_INPUT_ID = "titulo";
+const TEXT_MESSAGE_MAX_LENGTH = 2000;
+const BOX_MESSAGE_MAX_LENGTH = 4000;
+const TITLE_MAX_LENGTH = 256;
 
 type SpecialMention = "none" | "everyone" | "here";
+type SayStyle = "box" | "txt";
 
 interface SayOptions {
   channelId: string;
   mention: SpecialMention;
   roleId: string | null;
   userId: string | null;
+  style: SayStyle;
+  color: number | null;
 }
+
+const COLOR_CHOICES = [
+  { name: "Sem cor", value: "none" },
+  { name: "Roxo", value: "9b59b6" },
+  { name: "Azul", value: "3498db" },
+  { name: "Verde", value: "2ecc71" },
+  { name: "Amarelo", value: "f1c40f" },
+  { name: "Laranja", value: "e67e22" },
+  { name: "Vermelho", value: "e74c3c" },
+  { name: "Rosa", value: "e91e63" },
+  { name: "Branco", value: "ffffff" },
+] as const;
 
 const ALLOWED_CHANNEL_TYPES = [
   ChannelType.GuildText,
@@ -55,12 +77,27 @@ const sayCommand = new SlashCommandBuilder()
     option
       .setName("mensagem")
       .setDescription("Texto da mensagem. Use \\n para quebrar linha. Deixe vazio para abrir um editor")
-      .setMaxLength(DISCORD_MESSAGE_MAX_LENGTH)
+      .setMaxLength(BOX_MESSAGE_MAX_LENGTH)
+  )
+  .addStringOption((option) =>
+    option
+      .setName("estilo")
+      .setDescription("Formato da mensagem (padrão: caixinha)")
+      .addChoices(
+        { name: "Caixinha", value: "box" },
+        { name: "Texto normal", value: "txt" }
+      )
+  )
+  .addStringOption((option) =>
+    option
+      .setName("titulo")
+      .setDescription("Título grande no topo da mensagem (ex.: 📄 Changelog - 02.10)")
+      .setMaxLength(TITLE_MAX_LENGTH)
   )
   .addStringOption((option) =>
     option
       .setName("mencao")
-      .setDescription("Menção especial no início da mensagem")
+      .setDescription("Menção especial (@everyone / @here)")
       .addChoices(
         { name: "Nenhuma", value: "none" },
         { name: "@everyone", value: "everyone" },
@@ -68,10 +105,16 @@ const sayCommand = new SlashCommandBuilder()
       )
   )
   .addRoleOption((option) =>
-    option.setName("cargo").setDescription("Cargo para mencionar no início da mensagem")
+    option.setName("cargo").setDescription("Cargo para mencionar")
   )
   .addUserOption((option) =>
-    option.setName("usuario").setDescription("Usuário para mencionar no início da mensagem")
+    option.setName("usuario").setDescription("Usuário para mencionar")
+  )
+  .addStringOption((option) =>
+    option
+      .setName("cor")
+      .setDescription("Cor da faixa lateral da caixinha (padrão: sem cor)")
+      .addChoices(...COLOR_CHOICES)
   )
   .addChannelOption((option) =>
     option
@@ -88,6 +131,16 @@ function parseMention(value: string | null | undefined): SpecialMention {
   return value === "everyone" || value === "here" ? value : "none";
 }
 
+function parseStyle(value: string | null | undefined): SayStyle {
+  return value === "txt" ? "txt" : "box";
+}
+
+function parseColor(value: string | null | undefined): number | null {
+  if (!value || value === "none" || value === "-") return null;
+  const parsed = Number.parseInt(value, 16);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function encodeModalId(options: SayOptions): string {
   return [
     SAY_COMMAND_NAME,
@@ -95,11 +148,13 @@ function encodeModalId(options: SayOptions): string {
     options.mention,
     options.roleId ?? "-",
     options.userId ?? "-",
+    options.style,
+    options.color === null ? "-" : options.color.toString(16),
   ].join(":");
 }
 
 function decodeModalId(customId: string): SayOptions | null {
-  const [name, channelId, mention, roleId, userId] = customId.split(":");
+  const [name, channelId, mention, roleId, userId, style, color] = customId.split(":");
   if (name !== SAY_COMMAND_NAME || !channelId) return null;
 
   return {
@@ -107,20 +162,77 @@ function decodeModalId(customId: string): SayOptions | null {
     mention: parseMention(mention),
     roleId: roleId && roleId !== "-" ? roleId : null,
     userId: userId && userId !== "-" ? userId : null,
+    style: parseStyle(style),
+    color: parseColor(color),
   };
 }
 
-function buildContent(options: SayOptions, text: string): string {
+function buildMentionText(options: SayOptions): string {
   const mentions: string[] = [];
   if (options.mention === "everyone") mentions.push("@everyone");
   if (options.mention === "here") mentions.push("@here");
   if (options.roleId) mentions.push(`<@&${options.roleId}>`);
   if (options.userId) mentions.push(`<@${options.userId}>`);
+  return mentions.join(" ");
+}
 
-  const body = text.trim();
-  const header = mentions.join(" ");
-  if (header && body) return `${header}\n${body}`;
-  return header || body;
+function formatTitle(title: string): string {
+  return title.startsWith("#") ? title : `# ${title}`;
+}
+
+type BuildResult = { payload: MessageCreateOptions } | { error: string };
+
+function buildTextPayload(options: SayOptions, title: string, body: string): BuildResult {
+  const parts = [buildMentionText(options), title ? formatTitle(title) : "", body].filter(Boolean);
+  const content = parts.join("\n");
+
+  if (!content) return { error: "❌ A mensagem está vazia. Escreva algo ou escolha uma menção." };
+  if (content.length > TEXT_MESSAGE_MAX_LENGTH) {
+    return {
+      error: `❌ A mensagem ficou com ${content.length} caracteres (máximo ${TEXT_MESSAGE_MAX_LENGTH} no estilo texto normal). Use o estilo caixinha para até ${BOX_MESSAGE_MAX_LENGTH}.`,
+    };
+  }
+
+  return { payload: { content } };
+}
+
+function buildBoxPayload(options: SayOptions, title: string, body: string): BuildResult {
+  const mentionText = buildMentionText(options);
+  const sections = [
+    title ? formatTitle(title) : "",
+    body,
+    mentionText ? `-# ${mentionText}` : "",
+  ].filter(Boolean);
+
+  if (sections.length === 0) {
+    return { error: "❌ A mensagem está vazia. Escreva algo, um título ou escolha uma menção." };
+  }
+
+  const totalLength = sections.reduce((sum, section) => sum + section.length, 0);
+  if (totalLength > BOX_MESSAGE_MAX_LENGTH) {
+    return {
+      error: `❌ A caixinha ficou com ${totalLength} caracteres (máximo ${BOX_MESSAGE_MAX_LENGTH}, somando título, texto e menções).`,
+    };
+  }
+
+  const container = new ContainerBuilder();
+  if (options.color !== null) container.setAccentColor(options.color);
+
+  sections.forEach((section, index) => {
+    if (index > 0) {
+      container.addSeparatorComponents((separator) =>
+        separator.setDivider(true).setSpacing(SeparatorSpacingSize.Large)
+      );
+    }
+    container.addTextDisplayComponents((text) => text.setContent(section));
+  });
+
+  return {
+    payload: {
+      components: [container],
+      flags: MessageFlags.IsComponentsV2,
+    },
+  };
 }
 
 async function resolveTargetChannel(
@@ -144,7 +256,8 @@ async function resolveTargetChannel(
 async function sendAsBot(
   guild: Guild,
   options: SayOptions,
-  text: string,
+  rawTitle: string,
+  rawBody: string,
   requestedBy: string
 ): Promise<string> {
   const channel = await resolveTargetChannel(guild, options.channelId);
@@ -152,13 +265,13 @@ async function sendAsBot(
     return "❌ Não consegui encontrar esse canal ou ele não aceita mensagens de texto.";
   }
 
-  const content = buildContent(options, text);
-  if (!content) {
-    return "❌ A mensagem está vazia. Escreva algo ou escolha uma menção.";
-  }
-  if (content.length > DISCORD_MESSAGE_MAX_LENGTH) {
-    return `❌ A mensagem ficou com ${content.length} caracteres (máximo ${DISCORD_MESSAGE_MAX_LENGTH}, contando as menções).`;
-  }
+  const title = rawTitle.trim();
+  const body = rawBody.trim();
+  const built =
+    options.style === "box"
+      ? buildBoxPayload(options, title, body)
+      : buildTextPayload(options, title, body);
+  if ("error" in built) return built.error;
 
   const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
   const permissions = me ? channel.permissionsFor(me) : null;
@@ -188,7 +301,7 @@ async function sendAsBot(
   if (options.mention !== "none") parse.push("everyone");
 
   try {
-    await channel.send({ content, allowedMentions: { parse } });
+    await channel.send({ ...built.payload, allowedMentions: { parse } });
   } catch (error) {
     console.error("[FALAR] Falha ao enviar mensagem:", error);
     return "❌ O Discord recusou o envio da mensagem. Verifique minhas permissões no canal.";
@@ -220,24 +333,42 @@ async function handleChatInput(interaction: ChatInputCommandInteraction): Promis
     mention: parseMention(interaction.options.getString("mencao")),
     roleId: interaction.options.getRole("cargo")?.id ?? null,
     userId: interaction.options.getUser("usuario")?.id ?? null,
+    style: parseStyle(interaction.options.getString("estilo")),
+    color: parseColor(interaction.options.getString("cor")),
   };
 
+  const title = interaction.options.getString("titulo") ?? "";
   const rawText = interaction.options.getString("mensagem");
 
   // Sem texto: abre um editor (modal) com suporte a várias linhas.
   if (rawText === null) {
-    const input = new TextInputBuilder()
+    const hasOtherContent =
+      options.mention !== "none" || Boolean(options.roleId) || Boolean(options.userId) || Boolean(title);
+
+    const titleInput = new TextInputBuilder()
+      .setCustomId(MODAL_TITLE_INPUT_ID)
+      .setLabel("Título (opcional)")
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder("Ex.: 📄 Changelog - 02.10")
+      .setRequired(false)
+      .setMaxLength(TITLE_MAX_LENGTH);
+    if (title) titleInput.setValue(title);
+
+    const messageInput = new TextInputBuilder()
       .setCustomId(MODAL_MESSAGE_INPUT_ID)
       .setLabel("Mensagem")
       .setStyle(TextInputStyle.Paragraph)
-      .setPlaceholder("Escreva aqui a mensagem que o bot vai enviar...")
-      .setRequired(options.mention === "none" && !options.roleId && !options.userId)
-      .setMaxLength(DISCORD_MESSAGE_MAX_LENGTH);
+      .setPlaceholder("### 🔄 Atualizado\n- Item da lista\n**negrito**, *itálico*, `código`...")
+      .setRequired(!hasOtherContent)
+      .setMaxLength(options.style === "box" ? BOX_MESSAGE_MAX_LENGTH : TEXT_MESSAGE_MAX_LENGTH);
 
     const modal = new ModalBuilder()
       .setCustomId(encodeModalId(options))
-      .setTitle("Enviar mensagem como o bot")
-      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      .setTitle(options.style === "box" ? "Enviar caixinha como o bot" : "Enviar mensagem como o bot")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(messageInput)
+      );
 
     await interaction.showModal(modal);
     return;
@@ -245,7 +376,7 @@ async function handleChatInput(interaction: ChatInputCommandInteraction): Promis
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const text = rawText.replace(/\\n/g, "\n");
-  const result = await sendAsBot(interaction.guild, options, text, interaction.user.tag);
+  const result = await sendAsBot(interaction.guild, options, title, text, interaction.user.tag);
   await interaction.editReply({ content: result });
 }
 
@@ -262,8 +393,9 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const title = interaction.fields.getTextInputValue(MODAL_TITLE_INPUT_ID) ?? "";
   const text = interaction.fields.getTextInputValue(MODAL_MESSAGE_INPUT_ID) ?? "";
-  const result = await sendAsBot(interaction.guild, options, text, interaction.user.tag);
+  const result = await sendAsBot(interaction.guild, options, title, text, interaction.user.tag);
   await interaction.editReply({ content: result });
 }
 

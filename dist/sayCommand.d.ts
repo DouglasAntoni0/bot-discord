@@ -4,6 +4,7 @@ import { Client, Guild } from "discord.js";
  * - Apenas administradores podem usar (escondido para os demais e verificado em runtime).
  * - A resposta ao admin é efêmera, então ninguém vê quem enviou.
  * - Permite mencionar @everyone, @here, um cargo e/ou um usuário.
+ * - Estilo "caixinha" usa os Components V2 do Discord (container com título, divisórias e rodapé).
  */
 export declare const SAY_COMMAND_NAME = "falar";
 /** Cria/atualiza o comando /falar no servidor (registro por servidor é instantâneo). */
