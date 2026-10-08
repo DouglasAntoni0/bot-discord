@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const discord_js_1 = require("discord.js");
 const dotenv_1 = require("dotenv");
 const logRetention_1 = require("./logRetention");
+const sayCommand_1 = require("./sayCommand");
 (0, dotenv_1.config)();
 const client = new discord_js_1.Client({
     intents: [
@@ -446,6 +447,7 @@ client.once(discord_js_1.Events.ClientReady, async (readyClient) => {
     console.log("═══════════════════════════════════════════════════════");
     for (const guild of readyClient.guilds.cache.values()) {
         await validateLogChannel(guild);
+        await (0, sayCommand_1.registerSayCommand)(guild);
     }
     initializeActiveVoiceSessions(readyClient);
     void cleanupOldLogs(readyClient);
@@ -825,6 +827,7 @@ async function cleanupOldLogs(readyClient) {
         console.log("[AUTO CLEANUP] Reconciliação concluída.");
     }
 }
+(0, sayCommand_1.setupSayCommand)(client);
 client.on(discord_js_1.Events.Error, (error) => {
     console.error("[DISCORD.JS ERROR]", error);
 });

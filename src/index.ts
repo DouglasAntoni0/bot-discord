@@ -22,6 +22,7 @@ import {
   partitionOwnedMessages,
   walkMessageHistory,
 } from "./logRetention";
+import { registerSayCommand, setupSayCommand } from "./sayCommand";
 
 config();
 
@@ -613,6 +614,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
   for (const guild of readyClient.guilds.cache.values()) {
     await validateLogChannel(guild);
+    await registerSayCommand(guild);
   }
 
   initializeActiveVoiceSessions(readyClient);
@@ -1089,6 +1091,8 @@ async function cleanupOldLogs(readyClient: Client<true>): Promise<void> {
     console.log("[AUTO CLEANUP] Reconciliação concluída.");
   }
 }
+
+setupSayCommand(client);
 
 client.on(Events.Error, (error) => {
   console.error("[DISCORD.JS ERROR]", error);

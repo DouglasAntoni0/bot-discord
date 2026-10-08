@@ -30,6 +30,15 @@ Bot de Discord em TypeScript com discord.js v14 para registrar eventos de voz, m
 - Preserva mensagens de outros autores e evita execuções sobrepostas.
 - Usa rastreamento com TTL por mensagem para não disparar alertas falsos.
 
+### Comando `/falar` (somente administradores)
+- Faz o bot enviar uma mensagem como se fosse ele. Ninguém vê quem usou o comando: a confirmação aparece só para você.
+- `mensagem`: o texto. Use `\n` para quebrar linha. Se deixar vazio, abre uma janela onde dá para escrever em várias linhas.
+- `mencao`: Nenhuma, `@everyone` ou `@here`.
+- `cargo` / `usuario`: menciona um cargo e/ou um usuário no começo da mensagem.
+- `canal`: canal de destino. Se não escolher, usa o canal atual.
+- O comando fica oculto para quem não é administrador e a permissão também é verificada quando ele é usado.
+- Para usar `@everyone`/`@here`, o bot precisa da permissão **Mencionar @everyone, @here e todos os cargos**.
+
 ## Configuração
 
 Crie um arquivo `.env` na raiz do projeto:
